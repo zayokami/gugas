@@ -2018,13 +2018,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                        L"GugasWnd", nullptr };
     ::RegisterClassExW(&wc);
     HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"Gugas",
-        WS_OVERLAPPEDWINDOW, 100, 100, 1000, 650,
+        WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800,
         nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) return 1;
 
     float dpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
     ::SetWindowPos(hwnd, nullptr, 0, 0,
-        (int)(1000 * dpiScale), (int)(650 * dpiScale),
+        (int)(1280 * dpiScale), (int)(800 * dpiScale),
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     if (!CreateDeviceD3D(hwnd)) {

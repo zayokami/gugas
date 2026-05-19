@@ -121,14 +121,19 @@ static int str_icontains(const char* haystack, const char* needleLower) {
     return strstr(lower, needleLower) != NULL;
 }
 
-/* 取 path 中最后一个 '\' 之后的部分（basename） */
-static const char* path_basename(const char* path) {
-    if (!path) return "";
-    const char* p = strrchr(path, '\\');
-    if (p) return p + 1;
-    p = strrchr(path, '/');
-    if (p) return p + 1;
-    return path;
+/* 宽字符 → UTF-8（ImGui/前端统一用 UTF-8） */
+static void wchar_to_utf8(const wchar_t* wsrc, char* out, size_t outSize) {
+    if (!out || outSize == 0) return;
+    out[0] = '\0';
+    if (!wsrc || !wsrc[0]) return;
+    int need = WideCharToMultiByte(CP_UTF8, 0, wsrc, -1, NULL, 0, NULL, NULL);
+    if (need <= 0 || (size_t)need > outSize) {
+        WideCharToMultiByte(CP_UTF8, 0, wsrc, (int)(outSize - 1),
+                            out, (int)outSize, NULL, NULL);
+        out[outSize - 1] = '\0';
+    } else {
+        WideCharToMultiByte(CP_UTF8, 0, wsrc, -1, out, need, NULL, NULL);
+    }
 }
 
 /* =============================================================================
@@ -151,10 +156,10 @@ GUGAS_CORE_API void Gugas_ScanProcesses(ProcessInfo* outList, int* outCount, int
         return;
     }
 
-    PROCESSENTRY32 pe = {0};
+    PROCESSENTRY32W pe = {0};
     pe.dwSize = sizeof(pe);
 
-    if (!Process32First(hSnap, &pe)) {
+    if (!Process32FirstW(hSnap, &pe)) {
         SetDllError("Process32First 失败", GetLastError());
         *outCount = -1;
         CloseHandle(hSnap);
@@ -167,13 +172,16 @@ GUGAS_CORE_API void Gugas_ScanProcesses(ProcessInfo* outList, int* outCount, int
         ProcessInfo* dst = &outList[*outCount];
         memset(dst, 0, sizeof(*dst));
         dst->pid = pe.th32ProcessID;
-        strncpy(dst->name, pe.szExeFile, sizeof(dst->name) - 1);
+        wchar_to_utf8(pe.szExeFile, dst->name, sizeof(dst->name));
 
         HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
                                    FALSE, pe.th32ProcessID);
         if (hProc) {
-            DWORD pathSize = (DWORD)sizeof(dst->fullPath);
-            if (!QueryFullProcessImageNameA(hProc, 0, dst->fullPath, &pathSize)) {
+            wchar_t wpath[1024] = {0};
+            DWORD pathSize = (DWORD)(sizeof(wpath)/sizeof(wpath[0]));
+            if (QueryFullProcessImageNameW(hProc, 0, wpath, &pathSize)) {
+                wchar_to_utf8(wpath, dst->fullPath, sizeof(dst->fullPath));
+            } else {
                 dst->fullPath[0] = '\0';
             }
             CloseHandle(hProc);
@@ -208,7 +216,7 @@ GUGAS_CORE_API void Gugas_ScanProcesses(ProcessInfo* outList, int* outCount, int
         }
 
         (*outCount)++;
-    } while (Process32Next(hSnap, &pe));
+    } while (Process32NextW(hSnap, &pe));
 
     CloseHandle(hSnap);
 }
@@ -242,9 +250,11 @@ GUGAS_CORE_API void Gugas_ScanDrivers(DriverInfo* outList, int* outCount, int ma
         DriverInfo* dst = &outList[*outCount];
         memset(dst, 0, sizeof(*dst));
 
-        if (GetDeviceDriverBaseNameA(drivers[i], dst->name, sizeof(dst->name)) == 0) {
+        wchar_t wname[256] = {0};
+        if (GetDeviceDriverBaseNameW(drivers[i], wname, ARRAYSIZE(wname)) == 0) {
             continue;
         }
+        wchar_to_utf8(wname, dst->name, sizeof(dst->name));
 
         const char* hit = find_suspicious_kw(dst->name);
         if (hit) {
@@ -279,12 +289,13 @@ static void get_process_name_by_pid(DWORD pid, char* out, size_t outSize) {
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProc) return;
 
-    char fullPath[1024] = {0};
-    DWORD sz = (DWORD)sizeof(fullPath);
-    if (QueryFullProcessImageNameA(hProc, 0, fullPath, &sz)) {
-        const char* base = path_basename(fullPath);
-        strncpy(out, base, outSize - 1);
-        out[outSize - 1] = '\0';
+    wchar_t wpath[1024] = {0};
+    DWORD sz = (DWORD)ARRAYSIZE(wpath);
+    if (QueryFullProcessImageNameW(hProc, 0, wpath, &sz)) {
+        wchar_t* p = wcsrchr(wpath, L'\\');
+        if (!p) p = wcsrchr(wpath, L'/');
+        const wchar_t* base = p ? (p + 1) : wpath;
+        wchar_to_utf8(base, out, outSize);
     }
     CloseHandle(hProc);
 }
@@ -338,8 +349,11 @@ static BOOL CALLBACK overlay_enum_proc(HWND hwnd, LPARAM lParam) {
     dst->exStyle = (DWORD)exStyle;
     strncpy(dst->reason, reason, sizeof(dst->reason) - 1);
 
-    GetWindowTextA(hwnd, dst->title, (int)sizeof(dst->title));
-    GetClassNameA(hwnd, dst->className, (int)sizeof(dst->className));
+    wchar_t wbuf[256];
+    GetWindowTextW(hwnd, wbuf, ARRAYSIZE(wbuf));
+    wchar_to_utf8(wbuf, dst->title, sizeof(dst->title));
+    GetClassNameW(hwnd, wbuf, ARRAYSIZE(wbuf));
+    wchar_to_utf8(wbuf, dst->className, sizeof(dst->className));
 
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
