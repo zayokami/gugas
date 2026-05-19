@@ -118,6 +118,35 @@ set_target_properties(Gugas PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# UAC 管理员权限清单（默认以管理员身份运行）
+# ---------------------------------------------------------------------------
+set(GUGAS_MANIFEST_CONTENT "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">
+  <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v2\">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level=\"requireAdministrator\" uiAccess=\"false\"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>")
+
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gugas.manifest" "${GUGAS_MANIFEST_CONTENT}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gugas.rc"
+    "1 RT_MANIFEST \"${CMAKE_CURRENT_BINARY_DIR}/gugas.manifest\"\n")
+
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gugas_rc.o
+    COMMAND windres -i ${CMAKE_CURRENT_BINARY_DIR}/gugas.rc
+                    -o ${CMAKE_CURRENT_BINARY_DIR}/gugas_rc.o
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/gugas.rc
+            ${CMAKE_CURRENT_BINARY_DIR}/gugas.manifest
+    COMMENT "Compiling UAC manifest resource"
+)
+
+target_sources(Gugas PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/gugas_rc.o)
+
+# ---------------------------------------------------------------------------
 # 安装规则（可选）
 # ---------------------------------------------------------------------------
 install(TARGETS gugas_core Gugas
