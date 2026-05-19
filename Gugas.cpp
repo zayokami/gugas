@@ -1987,7 +1987,7 @@ static void DrawMainWindow() {
     ImGui::Text(u8"Gugas v0.1.5");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::TextDisabled(u8" a zayoka presents);
+    ImGui::TextDisabled(u8"  a zayoka presents");
     ImGui::Separator();
 
     DrawNotifications(ImGui::GetIO().DeltaTime);

@@ -136,7 +136,34 @@ set(GUGAS_MANIFEST_CONTENT "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=
 
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gugas.manifest" "${GUGAS_MANIFEST_CONTENT}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gugas.rc"
-    "1 RT_MANIFEST \"${CMAKE_CURRENT_BINARY_DIR}/gugas.manifest\"\n")
+    "1 RT_MANIFEST \"${CMAKE_CURRENT_BINARY_DIR}/gugas.manifest\"\n"
+    "\n"
+    "1 VERSIONINFO\n"
+    "FILEVERSION    0,1,5,0\n"
+    "PRODUCTVERSION 0,1,5,0\n"
+    "FILEOS         0x40004\n"
+    "FILETYPE       0x1\n"
+    "BEGIN\n"
+    "  BLOCK \"StringFileInfo\"\n"
+    "  BEGIN\n"
+    "    BLOCK \"080404b0\"\n"
+    "    BEGIN\n"
+    "      VALUE \"FileDescription\",  \"Gugas Windows Security Audit Tool\\0\"\n"
+    "      VALUE \"FileVersion\",      \"0.1.5\\0\"\n"
+    "      VALUE \"InternalName\",     \"Gugas.exe\\0\"\n"
+    "      VALUE \"OriginalFilename\", \"Gugas.exe\\0\"\n"
+    "      VALUE \"ProductName\",      \"Gugas\\0\"\n"
+    "      VALUE \"ProductVersion\",   \"0.1.5\\0\"\n"
+    "      VALUE \"LegalCopyright\",   \"Copyright (c) 2026 zayoka\\0\"\n"
+    "      VALUE \"CompanyName\",      \"zayoka\\0\"\n"
+    "    END\n"
+    "  END\n"
+    "  BLOCK \"VarFileInfo\"\n"
+    "  BEGIN\n"
+    "    VALUE \"Translation\", 0x0804, 1200\n"
+    "  END\n"
+    "END\n"
+    )
 
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gugas_rc.o
