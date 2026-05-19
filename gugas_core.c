@@ -1,6 +1,8 @@
 /* =============================================================================
  * gugas_core.c
  *
+ * Copyright (c) 2026 zayoka
+ *
  * Compile (DLL) / 编译命令：
  *   C:/mingw64/bin/gcc -std=c11 -O2 -shared \
  *       -Wno-stringop-truncation \

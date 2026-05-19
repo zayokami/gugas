@@ -3,7 +3,7 @@
  *
  * MIT License (中英双语 / Bilingual)
  * ---------------------------------------------------------------------------
- * Copyright (c) 2026 Gugas Project Contributors
+ * Copyright (c) 2026 zayoka
  *
  * EN: Permission is hereby granted, free of charge, to any person obtaining a
  *     copy of this software and associated documentation files (the "Software"),
