@@ -59,7 +59,7 @@ set(IMGUI_SOURCES
 # ---------------------------------------------------------------------------
 # 目标 1：gugas_core.dll（纯 C 检测核心）
 # ---------------------------------------------------------------------------
-add_library(gugas_core SHARED gugas_core.c)
+add_library(gugas_core SHARED gugas_core.c gugas_diskscan.c)
 
 target_compile_definitions(gugas_core PRIVATE GUGAS_CORE_BUILD)
 

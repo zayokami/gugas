@@ -20,6 +20,7 @@
 #endif
 
 #include "gugas_core.h"
+#include "gugas_diskscan.h"
 
 #include <windows.h>
 #include <tlhelp32.h>             /* CreateToolhelp32Snapshot / Process32First */
@@ -912,89 +913,6 @@ GUGAS_CORE_API void Gugas_ScanNetworkConnections(ConnectionInfo* outList,
  * Gugas_ScanFileSystem —— 递归扫描单个目录下的可疑文件
  * =============================================================================
  */
-static void scan_dir_recurse(const char* root, const char* cur,
-                             int maxDepth, int curDepth,
-                             FileEntry* outList, int* outCount, int maxCount) {
-    if (*outCount >= maxCount) return;
-    if (maxDepth > 0 && curDepth > maxDepth) return;
-
-    char sp[MAX_PATH * 2];
-    snprintf(sp, sizeof(sp), "%s\\*.*", cur);
-
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(sp, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-
-    do {
-        if (*outCount >= maxCount) break;
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
-            continue;
-
-        char fp[MAX_PATH * 2];
-        snprintf(fp, sizeof(fp), "%s\\%s", cur, fd.cFileName);
-
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-            continue; /* 跳过符号链接/ junction */
-
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            scan_dir_recurse(root, fp, maxDepth, curDepth + 1,
-                             outList, outCount, maxCount);
-        } else {
-            const char* ext = strrchr(fd.cFileName, '.');
-            int isExec = 0;
-            if (ext) {
-                char el[16];
-                str_to_lower_copy(ext, el, sizeof(el));
-                if (strcmp(el, ".exe") == 0 || strcmp(el, ".dll") == 0 ||
-                    strcmp(el, ".sys") == 0 || strcmp(el, ".bat") == 0 ||
-                    strcmp(el, ".cmd") == 0 || strcmp(el, ".vbs") == 0 ||
-                    strcmp(el, ".ps1") == 0 || strcmp(el, ".wsf") == 0 ||
-                    strcmp(el, ".scr") == 0) {
-                    isExec = 1;
-                }
-            }
-
-            int suspicious = 0;
-            char reason[256] = {0};
-            if (isExec) {
-                const char* hit = find_suspicious_kw(fd.cFileName);
-                if (hit) {
-                    suspicious = 1;
-                    snprintf(reason, sizeof(reason), "文件名命中敏感词: '%s'", hit);
-                } else if (str_icontains(fp, "\\temp\\")) {
-                    suspicious = 1;
-                    snprintf(reason, sizeof(reason), "可执行文件位于 \\Temp\\");
-                } else if (str_icontains(fp, "\\appdata\\")) {
-                    suspicious = 1;
-                    snprintf(reason, sizeof(reason), "可执行文件位于 \\AppData\\");
-                } else if (str_icontains(fp, "\\downloads\\")) {
-                    suspicious = 1;
-                    snprintf(reason, sizeof(reason), "可执行文件位于 \\Downloads\\");
-                }
-            }
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) && isExec && !suspicious) {
-                suspicious = 1;
-                snprintf(reason, sizeof(reason), "隐藏的可执行文件");
-            }
-
-            if (suspicious) {
-                FileEntry* dst = &outList[*outCount];
-                memset(dst, 0, sizeof(*dst));
-                strncpy(dst->path, fp, sizeof(dst->path) - 1);
-                strncpy(dst->name, fd.cFileName, sizeof(dst->name) - 1);
-                dst->attributes = fd.dwFileAttributes;
-                dst->sizeHigh   = fd.nFileSizeHigh;
-                dst->sizeLow    = fd.nFileSizeLow;
-                dst->writeTime  = fd.ftLastWriteTime;
-                dst->isSuspicious = 1;
-                strncpy(dst->reason, reason, sizeof(dst->reason) - 1);
-                (*outCount)++;
-            }
-        }
-    } while (FindNextFileA(hFind, &fd));
-    FindClose(hFind);
-}
-
 GUGAS_CORE_API void Gugas_ScanFileSystem(const char* rootPath,
                                          FileEntry* outList,
                                          int* outCount,
@@ -1007,30 +925,21 @@ GUGAS_CORE_API void Gugas_ScanFileSystem(const char* rootPath,
         return;
     }
     *outCount = 0;
-    scan_dir_recurse(rootPath, rootPath, maxDepth, 0,
-                     outList, outCount, maxCount);
+    int n = Gds_ScanDirectory(rootPath, (GdsFileEntry*)outList,
+                               maxCount, maxDepth, NULL);
+    if (n < 0) {
+        SetDllError("Gds_ScanDirectory 失败", 0);
+        *outCount = -1;
+    } else {
+        *outCount = n;
+    }
 }
 
 /* =============================================================================
  * Gugas_ScanFileSystemMulti —— 多线程并行扫描多个根目录
+ *   使用 gugas_diskscan 模块的 Gds_ScanDrivesMulti，内联汇编原子控制进度
  * =============================================================================
  */
-typedef struct {
-    const char* rootPath;
-    int         maxDepth;
-    FileEntry*  localList;
-    int         localCount;
-    int         localMax;
-} FSThreadData;
-
-static DWORD WINAPI fs_thread_proc(LPVOID lpParam) {
-    FSThreadData* d = (FSThreadData*)lpParam;
-    d->localCount = 0;
-    Gugas_ScanFileSystem(d->rootPath, d->localList, &d->localCount,
-                         d->localMax, d->maxDepth);
-    return 0;
-}
-
 GUGAS_CORE_API void Gugas_ScanFileSystemMulti(const char** rootPaths,
                                               int rootCount,
                                               FileEntry* outList,
@@ -1045,41 +954,28 @@ GUGAS_CORE_API void Gugas_ScanFileSystemMulti(const char** rootPaths,
     }
     *outCount = 0;
 
-    if (rootCount == 1) {
-        Gugas_ScanFileSystem(rootPaths[0], outList, outCount, maxCount, maxDepth);
-        return;
+    /* 提取盘符 */
+    char drives[26];
+    int dcount = 0;
+    for (int i = 0; i < rootCount && dcount < 26; i++) {
+        if (rootPaths[i] && rootPaths[i][0] && rootPaths[i][1] == ':')
+            drives[dcount++] = rootPaths[i][0];
     }
-
-    HANDLE* threads = (HANDLE*)calloc(rootCount, sizeof(HANDLE));
-    FSThreadData* tdata = (FSThreadData*)calloc(rootCount, sizeof(FSThreadData));
-    if (!threads || !tdata) {
-        SetDllError("内存分配失败", 0);
+    if (dcount == 0) {
+        SetDllError("无法从 rootPaths 提取有效盘符", 0);
         *outCount = -1;
-        free(threads); free(tdata);
         return;
     }
 
-    for (int i = 0; i < rootCount; i++) {
-        tdata[i].rootPath = rootPaths[i];
-        tdata[i].maxDepth = maxDepth;
-        tdata[i].localList = (FileEntry*)calloc(4096, sizeof(FileEntry));
-        tdata[i].localMax  = 4096;
-        tdata[i].localCount = 0;
-        threads[i] = CreateThread(NULL, 0, fs_thread_proc, &tdata[i], 0, NULL);
+    GdsScanMode mode = (maxDepth <= 2) ? GDS_MODE_QUICK : GDS_MODE_DEEP;
+    int n = Gds_ScanDrivesMulti(drives, dcount, mode,
+                                 (GdsFileEntry*)outList, maxCount, NULL);
+    if (n < 0) {
+        SetDllError("Gds_ScanDrivesMulti 失败", 0);
+        *outCount = -1;
+    } else {
+        *outCount = n;
     }
-
-    WaitForMultipleObjects(rootCount, threads, TRUE, INFINITE);
-
-    for (int i = 0; i < rootCount; i++) {
-        for (int j = 0; j < tdata[i].localCount && *outCount < maxCount; j++) {
-            outList[*outCount] = tdata[i].localList[j];
-            (*outCount)++;
-        }
-        free(tdata[i].localList);
-        if (threads[i]) CloseHandle(threads[i]);
-    }
-    free(threads);
-    free(tdata);
 }
 
 /* =============================================================================

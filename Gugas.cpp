@@ -26,6 +26,7 @@
 #include "imgui_impl_dx11.h"
 
 #include "gugas_core.h"
+#include "gugas_diskscan.h"
 
 #include <vector>
 #include <string>
@@ -246,6 +247,11 @@ struct AppState {
     bool fileScanRunning    = false;
     int  fileScanProgress   = 0;
     int  fileScanTotal      = 0;
+
+    /* 文件系统扫描 —— 盘符选择 */
+    bool selectedDrives[26] = {false};
+    int  selectedDriveCount = 0;
+    GdsProgress fileProgress = {0};
 };
 
 static AppState g_state;
@@ -469,39 +475,36 @@ static void RefreshNetwork() {
     }
 }
 
-static void RefreshFileSystemQuick() {
-    static FileEntry buf[4096];
-    int n = 0;
-    const char* roots[] = {
-        "C:\\Windows\\System32",
-        "C:\\Windows\\SysWOW64",
-        "C:\\ProgramData",
-    };
-    Gugas_ScanFileSystemMulti(roots, 3, buf, &n, 4096, 2);
-    if (n < 0) {
-        g_state.fileEntries.clear();
-        Notify(NotifyType::Error, u8"文件扫描失败：%s", Gugas_GetLastErrorString());
-    } else {
-        g_state.fileEntries.assign(buf, buf + n);
-        Notify(NotifyType::Info, u8"快速文件扫描完成，发现 %d 个可疑文件", n);
-    }
-}
-
-static void RefreshFileSystemDeep() {
+static void RefreshFileSystemScan(GdsScanMode mode) {
     static FileEntry buf[8192];
-    int n = 0;
-    const char* roots[] = {
-        "C:\\Windows",
-        "C:\\ProgramData",
-        "C:\\Users",
-    };
-    Gugas_ScanFileSystemMulti(roots, 3, buf, &n, 8192, 4);
+
+    /* 收集选中的盘符 */
+    char drives[26];
+    int dcount = 0;
+    for (int i = 0; i < 26; i++) {
+        if (g_state.selectedDrives[i])
+            drives[dcount++] = (char)('A' + i);
+    }
+    if (dcount == 0) {
+        Notify(NotifyType::Warning, u8"请至少选择一个盘符");
+        return;
+    }
+
+    Gds_ResetProgress(&g_state.fileProgress);
+    g_state.fileScanRunning = true;
+
+    int n = Gds_ScanDrivesMulti(drives, dcount, mode,
+                                 (GdsFileEntry*)buf, 8192,
+                                 &g_state.fileProgress);
+    g_state.fileScanRunning = false;
+
     if (n < 0) {
         g_state.fileEntries.clear();
-        Notify(NotifyType::Error, u8"深度文件扫描失败：%s", Gugas_GetLastErrorString());
+        Notify(NotifyType::Error, u8"文件扫描失败");
     } else {
         g_state.fileEntries.assign(buf, buf + n);
-        Notify(NotifyType::Info, u8"深度文件扫描完成，发现 %d 个可疑文件", n);
+        Notify(NotifyType::Info, u8"%s扫描完成，发现 %d 个可疑文件",
+               mode == GDS_MODE_QUICK ? u8"快速" : u8"深度", n);
     }
 }
 
@@ -1408,26 +1411,68 @@ static void DrawTab6_DeepScan() {
 }
 
 /* -----------------------------------------------------------------------------
- * Tab 7 —— 📁 文件系统扫描（多线程硬盘目录扫描）
+ * Tab 7 —— 📁 文件系统扫描（多线程硬盘目录扫描 + 盘符选择）
  * ---------------------------------------------------------------------------*/
 static void DrawTab7_FileSystem() {
-    if (ImGui::Button(u8"🚀 快速扫描", ImVec2(160, 0))) {
-        RefreshFileSystemQuick();
+    /* --- 盘符选择 --- */
+    char avail[26];
+    int availCount = Gds_GetAvailableDrives(avail, 26);
+
+    ImGui::Text(u8"选择扫描盘符：");
+    if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"可多选，每个盘符由独立线程并行扫描");
+    for (int i = 0; i < availCount; i++) {
+        if (i > 0) ImGui::SameLine();
+        char label[8];
+        snprintf(label, sizeof(label), "%c:##drv", avail[i]);
+        bool checked = g_state.selectedDrives[avail[i] - 'A'];
+        if (ImGui::Checkbox(label, &checked)) {
+            g_state.selectedDrives[avail[i] - 'A'] = checked;
+        }
     }
-    if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"多线程扫描 System32/SysWOW64/ProgramData，最大深度 2 层");
+    ImGui::SameLine();
+    if (ImGui::SmallButton(u8"全选")) {
+        for (int i = 0; i < availCount; i++)
+            g_state.selectedDrives[avail[i] - 'A'] = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton(u8"取消全选")) {
+        for (int i = 0; i < 26; i++)
+            g_state.selectedDrives[i] = false;
+    }
+    ImGui::Spacing();
+
+    /* --- 扫描按钮 --- */
+    bool hasSelection = false;
+    for (int i = 0; i < 26; i++) if (g_state.selectedDrives[i]) { hasSelection = true; break; }
+
+    ImGui::BeginDisabled(!hasSelection || g_state.fileScanRunning);
+    if (ImGui::Button(u8"🚀 快速扫描", ImVec2(160, 0))) {
+        RefreshFileSystemScan(GDS_MODE_QUICK);
+    }
+    if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"多线程扫描选中盘符的关键目录，最大深度 2 层");
     ImGui::SameLine();
     if (ImGui::Button(u8"🔥 深度扫描", ImVec2(160, 0))) {
-        RefreshFileSystemDeep();
+        RefreshFileSystemScan(GDS_MODE_DEEP);
     }
-    if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"多线程深度扫描 Windows/Users/ProgramData，最大深度 4 层，耗时较长");
-    ImGui::SameLine();
-    if (!g_state.fileEntries.empty()) {
+    if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"多线程深度扫描选中盘符，最大深度 4 层，耗时较长");
+    ImGui::EndDisabled();
+
+    /* --- 进度显示 --- */
+    if (g_state.fileScanRunning) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(u8"扫描中… 文件 %d / 可疑 %d / 目录 %d",
+            (int)g_state.fileProgress.filesScanned,
+            (int)g_state.fileProgress.filesSuspicious,
+            (int)g_state.fileProgress.dirsScanned);
+    } else if (!g_state.fileEntries.empty()) {
+        ImGui::SameLine();
         ImGui::TextDisabled(u8"上次扫描发现 %zu 个可疑文件", g_state.fileEntries.size());
     }
     ImGui::Spacing();
 
+    /* --- 结果表格 --- */
     if (g_state.fileEntries.empty()) {
-        ImGui::TextDisabled(u8"点击上方按钮开始文件系统扫描");
+        ImGui::TextDisabled(u8"选择盘符后点击扫描按钮开始文件系统扫描");
     } else {
         ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 16);
         if (ImGui::BeginTable("##files", 4,
@@ -1641,6 +1686,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     /* 加载规则 */
     g_rules.Load();
+
+    /* 默认选中 C 盘 */
+    g_state.selectedDrives['C' - 'A'] = true;
 
     g_state.isAdmin = IsUserAdmin();
     if (!g_state.isAdmin) {
