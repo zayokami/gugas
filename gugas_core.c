@@ -1071,6 +1071,416 @@ GUGAS_CORE_API void Gugas_ScanLoadedModules(DWORD pid,
     CloseHandle(hProc);
 }
 
+/* =============================================================================
+ * 键盘安全 & 隐匿线程检测
+ * =============================================================================
+ */
+
+/* --- NtQueryInformationThread（未文档化 API）函数指针 --- */
+typedef LONG (NTAPI *NtQueryInformationThread_t)(HANDLE ThreadHandle,
+    ULONG ThreadInformationClass, PVOID ThreadInformation,
+    ULONG ThreadInformationLength, PULONG ReturnLength);
+
+static NtQueryInformationThread_t get_ntqit(void) {
+    static NtQueryInformationThread_t p = NULL;
+    if (!p) {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (ntdll) p = (NtQueryInformationThread_t)GetProcAddress(ntdll, "NtQueryInformationThread");
+    }
+    return p;
+}
+
+/* --- 动态提取 syscall number（从 ntdll stub）--- */
+static DWORD get_syscall_number(const char* apiName) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return 0;
+    BYTE* addr = (BYTE*)GetProcAddress(ntdll, apiName);
+    if (!addr) return 0;
+    /* 期望: mov r10,rcx ; mov eax, imm32 ; syscall ; ret
+     * 字节码: 4C 8B D1 B8 NN NN NN 00 0F 05 C3 */
+    if (addr[0] == 0x4C && addr[1] == 0x8B && addr[2] == 0xD1 &&
+        addr[3] == 0xB8) {
+        return *(DWORD*)(addr + 4);
+    }
+    return 0;
+}
+
+/* --- MinGW x64 内联汇编 direct syscall（备用路径）--- */
+__attribute__((noinline))
+static LONG gugas_direct_syscall(DWORD syscallNum, HANDLE hThread, ULONG infoClass,
+                                  PVOID info, ULONG infoLen, PULONG retLen) {
+    LONG status;
+    (void)syscallNum; (void)hThread; (void)infoClass;
+    (void)info; (void)infoLen; (void)retLen;
+    /* Windows x64 syscall 约定：
+     *   R10=arg1(原RCX), RDX=arg2, R8=arg3, R9=arg4, stack=arg5+
+     *   EAX=syscall number
+     * 函数参数按 Windows x64 CC 到达：
+     *   RCX=syscallNum, RDX=hThread, R8=infoClass, R9=info,
+     *   [RSP+0x28]=infoLen, [RSP+0x30]=retLen
+     * 需要重排为：
+     *   R10=hThread, RDX=infoClass, R8=info, R9=infoLen, EAX=syscallNum
+     */
+    __asm__ __volatile__ (
+        "movq %%rdx, %%r10\n\t"        /* R10 = hThread */
+        "movq %%r8, %%rdx\n\t"         /* RDX = infoClass */
+        "movq %%r9, %%r8\n\t"          /* R8 = info */
+        "movq 0x28(%%rsp), %%r9\n\t"   /* R9 = infoLen */
+        "movl %%ecx, %%eax\n\t"        /* EAX = syscallNum */
+        "syscall"
+        : "=a"(status)
+        : /* operands already in correct registers per calling convention */
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory"
+    );
+    return status;
+}
+
+/* --- 批量检查进程导入表中是否含可疑键盘 API --- */
+static void check_keylogger_apis_batch(HANDLE hProc, int* hasHook,
+                                        int* hasRawInput, int* hasKeyPoll) {
+    *hasHook = 0; *hasRawInput = 0; *hasKeyPoll = 0;
+
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    if (!EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded))
+        return;
+
+    int n = (int)(cbNeeded / sizeof(HMODULE));
+    if (n > 1024) n = 1024;
+
+    for (int i = 0; i < n; i++) {
+        IMAGE_DOS_HEADER dosHdr;
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(hProc, hMods[i], &dosHdr, sizeof(dosHdr), &read))
+            continue;
+        if (dosHdr.e_magic != IMAGE_DOS_SIGNATURE)
+            continue;
+
+        IMAGE_NT_HEADERS ntHdr;
+        if (!ReadProcessMemory(hProc, (BYTE*)hMods[i] + dosHdr.e_lfanew,
+                               &ntHdr, sizeof(ntHdr), &read))
+            continue;
+        if (ntHdr.Signature != IMAGE_NT_SIGNATURE)
+            continue;
+
+        DWORD importRVA = ntHdr.OptionalHeader.DataDirectory[
+            IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+        DWORD importSize = ntHdr.OptionalHeader.DataDirectory[
+            IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+        if (importRVA == 0 || importSize == 0)
+            continue;
+
+        DWORD rva = importRVA;
+        while (rva < importRVA + importSize) {
+            IMAGE_IMPORT_DESCRIPTOR iid;
+            if (!ReadProcessMemory(hProc, (BYTE*)hMods[i] + rva,
+                                   &iid, sizeof(iid), &read))
+                break;
+            if (iid.Name == 0) break;
+
+            DWORD iltRVA = iid.OriginalFirstThunk
+                         ? iid.OriginalFirstThunk : iid.FirstThunk;
+            if (iltRVA == 0) {
+                rva += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+                continue;
+            }
+
+            DWORD entryRva = iltRVA;
+            while (1) {
+                ULONG_PTR iltEntry = 0;
+                if (!ReadProcessMemory(hProc, (BYTE*)hMods[i] + entryRva,
+                                       &iltEntry, sizeof(iltEntry), &read))
+                    break;
+                if (iltEntry == 0) break;
+
+                /* 按名称导入（最高位为0） */
+                ULONG_PTR highBit = ((ULONG_PTR)1 << (sizeof(ULONG_PTR)*8 - 1));
+                if ((iltEntry & highBit) == 0) {
+                    char nameBuf[64];
+                    /* IMAGE_IMPORT_BY_NAME: WORD Hint + CHAR Name[] */
+                    if (ReadProcessMemory(hProc,
+                            (BYTE*)hMods[i] + (DWORD)iltEntry + 2,
+                            nameBuf, sizeof(nameBuf), &read)) {
+                        nameBuf[sizeof(nameBuf)-1] = '\0';
+                        if (!*hasHook && (_stricmp(nameBuf, "SetWindowsHookExW") == 0 ||
+                                          _stricmp(nameBuf, "SetWindowsHookExA") == 0))
+                            *hasHook = 1;
+                        if (!*hasRawInput && _stricmp(nameBuf, "RegisterRawInputDevices") == 0)
+                            *hasRawInput = 1;
+                        if (!*hasKeyPoll && (_stricmp(nameBuf, "GetAsyncKeyState") == 0 ||
+                                             _stricmp(nameBuf, "GetKeyState") == 0 ||
+                                             _stricmp(nameBuf, "GetKeyboardState") == 0))
+                            *hasKeyPoll = 1;
+                        if (*hasHook && *hasRawInput && *hasKeyPoll)
+                            return; /* 全部找到，提前退出 */
+                    }
+                }
+                entryRva += sizeof(ULONG_PTR);
+            }
+            rva += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        }
+    }
+}
+
+/* =============================================================================
+ * Gugas_ScanKeyloggers —— 键盘安全启发式扫描
+ * =============================================================================
+ */
+GUGAS_CORE_API void Gugas_ScanKeyloggers(KeyloggerInfo* outList, int* outCount,
+                                          int maxCount) {
+    g_lastError[0] = '\0';
+    if (!outList || !outCount || maxCount <= 0) {
+        if (outCount) *outCount = -1;
+        SetDllError("参数非法", 0);
+        return;
+    }
+    *outCount = 0;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        SetDllError("CreateToolhelp32Snapshot 失败", GetLastError());
+        *outCount = -1;
+        return;
+    }
+
+    PROCESSENTRY32W pe = {0};
+    pe.dwSize = sizeof(pe);
+
+    if (!Process32FirstW(hSnap, &pe)) {
+        SetDllError("Process32FirstW 失败", GetLastError());
+        *outCount = -1;
+        CloseHandle(hSnap);
+        return;
+    }
+
+    do {
+        if (*outCount >= maxCount) break;
+        if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4) continue;
+
+        KeyloggerInfo* dst = &outList[*outCount];
+        memset(dst, 0, sizeof(*dst));
+        dst->pid = pe.th32ProcessID;
+        wchar_to_utf8(pe.szExeFile, dst->processName, sizeof(dst->processName));
+
+        /* 尝试打开进程进行导入表扫描 */
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                                   FALSE, pe.th32ProcessID);
+        if (hProc) {
+            wchar_t wpath[1024] = {0};
+            DWORD pathSize = (DWORD)(sizeof(wpath)/sizeof(wpath[0]));
+            if (QueryFullProcessImageNameW(hProc, 0, wpath, &pathSize))
+                wchar_to_utf8(wpath, dst->processPath, sizeof(dst->processPath));
+
+            check_keylogger_apis_batch(hProc, &dst->hasHookApi,
+                                       &dst->hasRawInputApi, &dst->hasKeyPollApi);
+            CloseHandle(hProc);
+        }
+
+        /* 风险评分 */
+        int score = 0;
+        if (dst->hasHookApi) score += 3;
+        if (dst->hasRawInputApi) score += 2;
+        if (dst->hasKeyPollApi) score += 1;
+        if (str_icontains(dst->processPath, "\\temp\\")) score += 2;
+        if (str_icontains(dst->processPath, "\\appdata\\")) score += 2;
+        if (str_icontains(dst->processPath, "\\downloads\\")) score += 2;
+        if (find_suspicious_kw(dst->processName)) score += 2;
+        if (find_suspicious_kw(dst->processPath)) score += 2;
+
+        /* 系统白名单：降低常见系统进程的误报 */
+        if (_stricmp(dst->processName, "explorer.exe") == 0 ||
+            _stricmp(dst->processName, "SearchIndexer.exe") == 0 ||
+            _stricmp(dst->processName, "ShellExperienceHost.exe") == 0 ||
+            _stricmp(dst->processName, "StartMenuExperienceHost.exe") == 0) {
+            if (dst->hasKeyPollApi) score -= 1;
+        }
+
+        if (score < 0) score = 0;
+        if (score > 10) score = 10;
+        dst->riskScore = score;
+        dst->isSuspicious = (score >= 3);
+
+        if (dst->isSuspicious) {
+            char reasons[256] = {0};
+            if (dst->hasHookApi)
+                strncat(reasons, "导入SetWindowsHookEx ", sizeof(reasons)-1);
+            if (dst->hasRawInputApi)
+                strncat(reasons, "导入RegisterRawInputDevices ", sizeof(reasons)-1);
+            if (dst->hasKeyPollApi)
+                strncat(reasons, "导入键盘轮询API ", sizeof(reasons)-1);
+            if (score >= 5 && (str_icontains(dst->processPath, "\\temp\\") ||
+                str_icontains(dst->processPath, "\\appdata\\"))) {
+                strncat(reasons, "路径在用户可写区域 ", sizeof(reasons)-1);
+            }
+            if (find_suspicious_kw(dst->processName)) {
+                strncat(reasons, "进程名含敏感词 ", sizeof(reasons)-1);
+            }
+            size_t L = strlen(reasons);
+            while (L > 0 && reasons[L-1] == ' ') reasons[--L] = '\0';
+            if (L == 0) strncpy(reasons, "综合风险评分触发", sizeof(reasons)-1);
+            strncpy(dst->reason, reasons, sizeof(dst->reason)-1);
+        } else {
+            strncpy(dst->reason, "正常", sizeof(dst->reason)-1);
+        }
+
+        (*outCount)++;
+    } while (Process32NextW(hSnap, &pe));
+
+    CloseHandle(hSnap);
+}
+
+/* =============================================================================
+ * Gugas_ScanGhostThreads —— 隐匿线程检测
+ * =============================================================================
+ */
+GUGAS_CORE_API void Gugas_ScanGhostThreads(GhostThreadInfo* outList,
+                                            int* outCount, int maxCount) {
+    g_lastError[0] = '\0';
+    if (!outList || !outCount || maxCount <= 0) {
+        if (outCount) *outCount = -1;
+        SetDllError("参数非法", 0);
+        return;
+    }
+    *outCount = 0;
+
+    NtQueryInformationThread_t ntqit = get_ntqit();
+    if (!ntqit) {
+        SetDllError("无法从 ntdll 获取 NtQueryInformationThread", 0);
+        *outCount = -1;
+        return;
+    }
+
+    DWORD syscallNum = get_syscall_number("NtQueryInformationThread");
+
+    HANDLE hProcSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcSnap == INVALID_HANDLE_VALUE) {
+        SetDllError("CreateToolhelp32Snapshot(PROCESS) 失败", GetLastError());
+        *outCount = -1;
+        return;
+    }
+
+    PROCESSENTRY32W pe = {0};
+    pe.dwSize = sizeof(pe);
+
+    if (!Process32FirstW(hProcSnap, &pe)) {
+        SetDllError("Process32FirstW 失败", GetLastError());
+        *outCount = -1;
+        CloseHandle(hProcSnap);
+        return;
+    }
+
+    do {
+        DWORD pid = pe.th32ProcessID;
+        if (pid == 0) continue;
+
+        char procName[256] = {0};
+        wchar_to_utf8(pe.szExeFile, procName, sizeof(procName));
+
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                                   FALSE, pid);
+        if (!hProc) continue;
+
+        /* 缓存模块列表用于验证线程启动地址 */
+        HMODULE hMods[1024];
+        DWORD cbNeeded = 0;
+        int modCount = 0;
+        struct ModRange { ULONG_PTR base; DWORD size; } mods[1024];
+        if (EnumProcessModules(hProc, hMods, sizeof(hMods), &cbNeeded)) {
+            modCount = (int)(cbNeeded / sizeof(HMODULE));
+            if (modCount > 1024) modCount = 1024;
+            for (int i = 0; i < modCount; i++) {
+                MODULEINFO mi;
+                if (GetModuleInformation(hProc, hMods[i], &mi, sizeof(mi))) {
+                    mods[i].base = (ULONG_PTR)mi.lpBaseOfDll;
+                    mods[i].size = mi.SizeOfImage;
+                } else {
+                    mods[i].base = 0;
+                    mods[i].size = 0;
+                }
+            }
+        }
+
+        /* 枚举该进程的所有线程 */
+        HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (hThreadSnap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te = {0};
+            te.dwSize = sizeof(te);
+            if (Thread32First(hThreadSnap, &te)) {
+                do {
+                    if (te.th32OwnerProcessID != pid) continue;
+                    if (*outCount >= maxCount) break;
+
+                    GhostThreadInfo* dst = &outList[*outCount];
+                    memset(dst, 0, sizeof(*dst));
+                    dst->pid = pid;
+                    strncpy(dst->processName, procName, sizeof(dst->processName)-1);
+                    dst->tid = te.th32ThreadID;
+
+                    HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION,
+                                                FALSE, te.th32ThreadID);
+                    if (hThread) {
+                        ULONG_PTR startAddr = 0;
+                        ULONG retLen = 0;
+                        LONG status = ntqit(hThread,
+                            9 /*ThreadQuerySetWin32StartAddress*/,
+                            &startAddr, sizeof(startAddr), &retLen);
+
+                        if (status != 0 && syscallNum != 0) {
+                            status = gugas_direct_syscall(syscallNum, hThread,
+                                9, &startAddr, sizeof(startAddr), &retLen);
+                        }
+
+                        if (status == 0 && retLen == sizeof(startAddr)) {
+                            dst->startAddress = startAddr;
+                            int inModule = 0;
+                            for (int i = 0; i < modCount; i++) {
+                                if (mods[i].base == 0 || mods[i].size == 0) continue;
+                                if (startAddr >= mods[i].base &&
+                                    startAddr < mods[i].base + mods[i].size) {
+                                    inModule = 1;
+                                    break;
+                                }
+                            }
+                            dst->isGhost = !inModule;
+                        }
+
+                        ULONG hideFlag = 0;
+                        retLen = 0;
+                        status = ntqit(hThread, 17 /*ThreadHideFromDebugger*/,
+                                       &hideFlag, sizeof(hideFlag), &retLen);
+                        if (status == 0 && retLen == sizeof(hideFlag)) {
+                            dst->isHiddenFromDebugger = (hideFlag != 0);
+                        }
+
+                        CloseHandle(hThread);
+                    }
+
+                    dst->isSuspicious = (dst->isGhost || dst->isHiddenFromDebugger);
+                    if (dst->isGhost && dst->isHiddenFromDebugger) {
+                        snprintf(dst->reason, sizeof(dst->reason),
+                            "隐匿线程 + 对调试器隐藏");
+                    } else if (dst->isGhost) {
+                        snprintf(dst->reason, sizeof(dst->reason),
+                            "启动地址不在任何模块范围内");
+                    } else if (dst->isHiddenFromDebugger) {
+                        snprintf(dst->reason, sizeof(dst->reason),
+                            "线程被标记为对调试器隐藏");
+                    } else {
+                        strncpy(dst->reason, "正常", sizeof(dst->reason)-1);
+                    }
+
+                    (*outCount)++;
+                } while (Thread32Next(hThreadSnap, &te));
+            }
+            CloseHandle(hThreadSnap);
+        }
+
+        CloseHandle(hProc);
+    } while (Process32NextW(hProcSnap, &pe));
+
+    CloseHandle(hProcSnap);
+}
+
 /* DLL 入口点 */
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
     (void)hinstDLL; (void)lpReserved;

@@ -151,6 +151,33 @@ typedef struct {
     char      reason[256];
 } ModuleInfo;
 
+/* 键盘安全检测结果 —— ScanKeyloggers 返回 */
+typedef struct {
+    DWORD pid;
+    char  processName[256];
+    char  processPath[1024];
+    int   riskScore;          /* 0-10 */
+    int   isSuspicious;       /* riskScore >= 3 */
+    int   hasHookApi;         /* 导入 SetWindowsHookEx */
+    int   hasRawInputApi;     /* 导入 RegisterRawInputDevices */
+    int   hasKeyPollApi;      /* 导入 GetAsyncKeyState 等 */
+    int   hasKeyboardHandle;  /* 持有键盘设备句柄 */
+    int   hasRawInputDevice;  /* 注册了 Raw Input 键盘设备 */
+    char  reason[256];        /* 中文描述 */
+} KeyloggerInfo;
+
+/* 隐匿线程检测结果 —— ScanGhostThreads 返回 */
+typedef struct {
+    DWORD pid;
+    char  processName[256];
+    DWORD tid;
+    ULONG_PTR startAddress;
+    int   isGhost;              /* 启动地址不在任何模块内 */
+    int   isHiddenFromDebugger; /* ThreadHideFromDebugger == TRUE */
+    int   isSuspicious;         /* isGhost || isHiddenFromDebugger */
+    char  reason[256];          /* 中文描述 */
+} GhostThreadInfo;
+
 /* -----------------------------------------------------------------------------
  * 导出接口
  * ---------------------------------------------------------------------------*/
@@ -227,6 +254,12 @@ GUGAS_CORE_API void Gugas_ScanLoadedModules(DWORD pid,
                                             ModuleInfo* outList,
                                             int* outCount,
                                             int maxCount);
+
+/* 扫描系统中的键盘记录器风险进程（导入表+句柄+RawInput启发式） */
+GUGAS_CORE_API void Gugas_ScanKeyloggers(KeyloggerInfo* outList, int* outCount, int maxCount);
+
+/* 扫描所有进程中的隐匿线程（Ghost Thread / Unbacked Thread） */
+GUGAS_CORE_API void Gugas_ScanGhostThreads(GhostThreadInfo* outList, int* outCount, int maxCount);
 
 #ifdef __cplusplus
 } /* extern "C" */

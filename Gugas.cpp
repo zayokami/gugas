@@ -225,6 +225,8 @@ struct AppState {
     std::vector<StartupEntry>  startups;
     std::vector<ConnectionInfo> connections;
     std::vector<GdsFileEntry>  fileEntries;
+    std::vector<KeyloggerInfo> keyloggers;
+    std::vector<GhostThreadInfo> ghostThreads;
 
     char passwordInput[256] = {0};
     char obfuscated[1024]   = {0};
@@ -262,6 +264,8 @@ struct AppState {
     char startupFilter[128] = {0};
     char connFilter[128]    = {0};
     char fileFilter[128]    = {0};
+    char keyloggerFilter[128]  = {0};
+    char ghostThreadFilter[128] = {0};
 };
 
 static AppState g_state;
@@ -496,6 +500,30 @@ static void RefreshNetwork() {
     }
 }
 
+static void RefreshKeyloggers() {
+    static KeyloggerInfo buf[2048];
+    int n = 0;
+    Gugas_ScanKeyloggers(buf, &n, 2048);
+    if (n < 0) {
+        g_state.keyloggers.clear();
+        Notify(NotifyType::Error, u8"键盘安全扫描失败：%s", Gugas_GetLastErrorString());
+    } else {
+        g_state.keyloggers.assign(buf, buf + n);
+    }
+}
+
+static void RefreshGhostThreads() {
+    static GhostThreadInfo buf[4096];
+    int n = 0;
+    Gugas_ScanGhostThreads(buf, &n, 4096);
+    if (n < 0) {
+        g_state.ghostThreads.clear();
+        Notify(NotifyType::Error, u8"隐匿线程扫描失败：%s", Gugas_GetLastErrorString());
+    } else {
+        g_state.ghostThreads.assign(buf, buf + n);
+    }
+}
+
 static void RefreshFileSystemScan(GdsScanMode mode) {
     static GdsFileEntry buf[8192];
 
@@ -705,7 +733,7 @@ static bool LoadFonts(float dpiScale) {
  * Tab 1 —— 进程审计（含一键加入白名单）
  * ---------------------------------------------------------------------------*/
 static void DrawTab1_Processes() {
-    if (ImGui::Button(u8"🔄 刷新扫描", ImVec2(140, 0))) RefreshProcesses();
+    if (ImGui::Button(u8"刷新扫描", ImVec2(140, 0))) RefreshProcesses();
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"重新执行进程扫描，更新当前列表");
     ImGui::SameLine();
 
@@ -718,7 +746,7 @@ static void DrawTab1_Processes() {
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180);
-    ImGui::InputTextWithHint("##procf", u8"🔍 筛选进程", g_state.procFilter, sizeof(g_state.procFilter));
+    ImGui::InputTextWithHint("##procf", u8"筛选进程", g_state.procFilter, sizeof(g_state.procFilter));
     ImGui::Spacing();
 
     if (g_state.procs.empty() && g_state.didInitialScan) {
@@ -879,7 +907,7 @@ static void DrawTab1_Processes() {
  * Tab 2 —— 驱动 & 窗口
  * ---------------------------------------------------------------------------*/
 static void DrawTab2_DriversWindows() {
-    if (ImGui::Button(u8"🔄 重新扫描", ImVec2(140, 0))) {
+    if (ImGui::Button(u8"重新扫描", ImVec2(140, 0))) {
         RefreshDrivers();
         RefreshOverlayWindows();
     }
@@ -891,7 +919,7 @@ static void DrawTab2_DriversWindows() {
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"需要管理员权限才能列出完整的内核驱动列表");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180);
-    ImGui::InputTextWithHint("##drvfilter", u8"🔍 筛选驱动", g_state.driverFilter, sizeof(g_state.driverFilter));
+    ImGui::InputTextWithHint("##drvfilter", u8"筛选驱动", g_state.driverFilter, sizeof(g_state.driverFilter));
     ImGui::Separator();
     if (g_state.drivers.empty() && g_state.didInitialScan) {
         ImGui::TextColored(col::v4(0xff,0x44,0x44), u8"⚠ 驱动扫描失败或权限不足");
@@ -964,7 +992,7 @@ static void DrawTab2_DriversWindows() {
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::DANGER), u8"⚠ 疑似覆盖层窗口");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180);
-    ImGui::InputTextWithHint("##wndfilter", u8"🔍 筛选窗口", g_state.windowFilter, sizeof(g_state.windowFilter));
+    ImGui::InputTextWithHint("##wndfilter", u8"筛选窗口", g_state.windowFilter, sizeof(g_state.windowFilter));
     ImGui::Separator();
     if (g_state.windows.empty() && g_state.didInitialScan) {
         ImGui::TextColored(col::v4(0xff,0x44,0x44), u8"⚠ 窗口扫描失败");
@@ -1037,6 +1065,208 @@ static void DrawTab2_DriversWindows() {
 }
 
 /* -----------------------------------------------------------------------------
+ * Tab 2b —— 键盘安全
+ * ---------------------------------------------------------------------------*/
+static void DrawTab2b_KeyboardSecurity() {
+    if (ImGui::Button(u8"扫描键盘风险", ImVec2(140, 0))) {
+        RefreshKeyloggers();
+    }
+    if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"扫描所有进程的导入表，检测潜在的键盘记录器行为");
+    ImGui::SameLine();
+
+    size_t sus = 0;
+    for (auto& k : g_state.keyloggers) if (k.isSuspicious) sus++;
+    ImGui::TextDisabled(u8"共 %zu 个进程，%zu 项可疑", g_state.keyloggers.size(), sus);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##klf", u8"筛选进程", g_state.keyloggerFilter, sizeof(g_state.keyloggerFilter));
+    ImGui::Spacing();
+
+    if (g_state.keyloggers.empty()) {
+        ImGui::TextDisabled(u8"点击上方按钮开始扫描键盘安全风险");
+        return;
+    }
+
+    ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 10);
+    if (ImGui::BeginTable("##keylog", 8,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+            ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, sz)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("PID",       ImGuiTableColumnFlags_WidthFixed, 60.0f, 0);
+        ImGui::TableSetupColumn(u8"进程名",   ImGuiTableColumnFlags_WidthFixed, 180.0f, 1);
+        ImGui::TableSetupColumn(u8"风险分",   ImGuiTableColumnFlags_WidthFixed, 60.0f, 2);
+        ImGui::TableSetupColumn(u8"钩子API",  ImGuiTableColumnFlags_WidthFixed, 70.0f, 3);
+        ImGui::TableSetupColumn(u8"RawInput", ImGuiTableColumnFlags_WidthFixed, 80.0f, 4);
+        ImGui::TableSetupColumn(u8"键轮询",   ImGuiTableColumnFlags_WidthFixed, 60.0f, 5);
+        ImGui::TableSetupColumn(u8"原因",     ImGuiTableColumnFlags_WidthStretch, 0.0f, 6);
+        ImGui::TableSetupColumn(u8"操作",     ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 80.0f, 7);
+        ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+            if (sort_specs->SpecsDirty) {
+                std::sort(g_state.keyloggers.begin(), g_state.keyloggers.end(),
+                    [&](const KeyloggerInfo& a, const KeyloggerInfo& b) {
+                        for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                            const auto& spec = sort_specs->Specs[n];
+                            int delta = 0;
+                            switch (spec.ColumnUserID) {
+                                case 0: delta = (int)a.pid - (int)b.pid; break;
+                                case 1: delta = _stricmp(a.processName, b.processName); break;
+                                case 2: delta = a.riskScore - b.riskScore; break;
+                                case 3: delta = a.hasHookApi - b.hasHookApi; break;
+                                case 4: delta = a.hasRawInputApi - b.hasRawInputApi; break;
+                                case 5: delta = a.hasKeyPollApi - b.hasKeyPollApi; break;
+                                case 6: delta = _stricmp(a.reason, b.reason); break;
+                            }
+                            if (delta != 0)
+                                return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                        }
+                        return false;
+                    });
+                sort_specs->SpecsDirty = false;
+            }
+
+        for (auto& k : g_state.keyloggers) {
+            if (g_state.keyloggerFilter[0]) {
+                char pidStr[32]; snprintf(pidStr, sizeof(pidStr), "%lu", (unsigned long)k.pid);
+                char scoreStr[16]; snprintf(scoreStr, sizeof(scoreStr), "%d", k.riskScore);
+                if (!str_icontains(pidStr, g_state.keyloggerFilter) &&
+                    !str_icontains(k.processName, g_state.keyloggerFilter) &&
+                    !str_icontains(k.processPath, g_state.keyloggerFilter) &&
+                    !str_icontains(scoreStr, g_state.keyloggerFilter) &&
+                    !str_icontains(k.reason, g_state.keyloggerFilter))
+                    continue;
+            }
+            ImGui::TableNextRow();
+            if (k.isSuspicious) {
+                ImU32 bg = (k.riskScore >= 7) ? col::DANGER_BG
+                          : IM_COL32(0xff, 0xaa, 0x00, 0x28);
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
+            }
+            ImGui::TableNextColumn(); ImGui::Text("%lu", (unsigned long)k.pid);
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(k.processName);
+            ImGui::TableNextColumn();
+            if (k.riskScore >= 7)
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::DANGER), "%d", k.riskScore);
+            else if (k.riskScore >= 3)
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::WARN_AMBER), "%d", k.riskScore);
+            else
+                ImGui::Text("%d", k.riskScore);
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(k.hasHookApi ? u8"是" : u8"—");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(k.hasRawInputApi ? u8"是" : u8"—");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(k.hasKeyPollApi ? u8"是" : u8"—");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(k.reason);
+            ImGui::TableNextColumn();
+            char btnId[64]; snprintf(btnId, sizeof(btnId), u8"+白##k%lu", (unsigned long)k.pid);
+            if (ImGui::SmallButton(btnId)) {
+                g_rules.processWhitelist.insert(g_rules.lower(k.processName));
+                g_rules.Save();
+                ApplyProcessRules(g_state.procs);
+                Notify(NotifyType::Info, u8"已将 '%s' 加入进程白名单", k.processName);
+            }
+            if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"加入白名单");
+        }
+        ImGui::EndTable();
+    }
+}
+
+/* -----------------------------------------------------------------------------
+ * Tab 2c —— 隐匿线程
+ * ---------------------------------------------------------------------------*/
+static void DrawTab2c_GhostThreads() {
+    if (ImGui::Button(u8"扫描隐匿线程", ImVec2(140, 0))) {
+        RefreshGhostThreads();
+    }
+    if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"枚举所有线程，检测启动地址不在模块范围内的 Ghost Threads");
+    ImGui::SameLine();
+
+    size_t sus = 0;
+    for (auto& t : g_state.ghostThreads) if (t.isSuspicious) sus++;
+    size_t ghosts = 0;
+    for (auto& t : g_state.ghostThreads) if (t.isGhost) ghosts++;
+    ImGui::TextDisabled(u8"共 %zu 个线程，%zu 个隐匿，%zu 项可疑",
+                        g_state.ghostThreads.size(), ghosts, sus);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##gtf", u8"筛选线程", g_state.ghostThreadFilter, sizeof(g_state.ghostThreadFilter));
+    ImGui::Spacing();
+
+    if (g_state.ghostThreads.empty()) {
+        ImGui::TextDisabled(u8"点击上方按钮开始扫描隐匿线程");
+        return;
+    }
+
+    ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 10);
+    if (ImGui::BeginTable("##ghost", 6,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+            ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, sz)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("PID",        ImGuiTableColumnFlags_WidthFixed, 60.0f, 0);
+        ImGui::TableSetupColumn(u8"进程名",    ImGuiTableColumnFlags_WidthFixed, 180.0f, 1);
+        ImGui::TableSetupColumn("TID",        ImGuiTableColumnFlags_WidthFixed, 60.0f, 2);
+        ImGui::TableSetupColumn(u8"启动地址",  ImGuiTableColumnFlags_WidthFixed, 140.0f, 3);
+        ImGui::TableSetupColumn(u8"隐藏调试器", ImGuiTableColumnFlags_WidthFixed, 90.0f, 4);
+        ImGui::TableSetupColumn(u8"原因",      ImGuiTableColumnFlags_WidthStretch, 0.0f, 5);
+        ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+            if (sort_specs->SpecsDirty) {
+                std::sort(g_state.ghostThreads.begin(), g_state.ghostThreads.end(),
+                    [&](const GhostThreadInfo& a, const GhostThreadInfo& b) {
+                        for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                            const auto& spec = sort_specs->Specs[n];
+                            int delta = 0;
+                            switch (spec.ColumnUserID) {
+                                case 0: delta = (int)a.pid - (int)b.pid; break;
+                                case 1: delta = _stricmp(a.processName, b.processName); break;
+                                case 2: delta = (int)a.tid - (int)b.tid; break;
+                                case 3:
+                                    delta = (a.startAddress > b.startAddress) ? 1
+                                          : (a.startAddress < b.startAddress) ? -1 : 0;
+                                    break;
+                                case 4: delta = a.isHiddenFromDebugger - b.isHiddenFromDebugger; break;
+                                case 5: delta = _stricmp(a.reason, b.reason); break;
+                            }
+                            if (delta != 0)
+                                return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                        }
+                        return false;
+                    });
+                sort_specs->SpecsDirty = false;
+            }
+
+        for (auto& t : g_state.ghostThreads) {
+            if (g_state.ghostThreadFilter[0]) {
+                char pidStr[32]; snprintf(pidStr, sizeof(pidStr), "%lu", (unsigned long)t.pid);
+                char tidStr[32]; snprintf(tidStr, sizeof(tidStr), "%lu", (unsigned long)t.tid);
+                char addrStr[32]; snprintf(addrStr, sizeof(addrStr), "0x%p", (void*)t.startAddress);
+                if (!str_icontains(pidStr, g_state.ghostThreadFilter) &&
+                    !str_icontains(tidStr, g_state.ghostThreadFilter) &&
+                    !str_icontains(addrStr, g_state.ghostThreadFilter) &&
+                    !str_icontains(t.processName, g_state.ghostThreadFilter) &&
+                    !str_icontains(t.reason, g_state.ghostThreadFilter))
+                    continue;
+            }
+            ImGui::TableNextRow();
+            if (t.isGhost) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
+            } else if (t.isHiddenFromDebugger) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(0xff, 0xaa, 0x00, 0x28));
+            }
+            ImGui::TableNextColumn(); ImGui::Text("%lu", (unsigned long)t.pid);
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(t.processName);
+            ImGui::TableNextColumn(); ImGui::Text("%lu", (unsigned long)t.tid);
+            ImGui::TableNextColumn(); ImGui::Text("0x%p", (void*)t.startAddress);
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(t.isHiddenFromDebugger ? u8"是" : u8"—");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(t.reason);
+        }
+        ImGui::EndTable();
+    }
+}
+
+/* -----------------------------------------------------------------------------
  * Tab 3 —— 🔑 密码保镖
  * ---------------------------------------------------------------------------*/
 static void DrawTab3_Password() {
@@ -1073,7 +1303,7 @@ static void DrawTab3_Password() {
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"重新扫描可疑覆盖层窗口");
     ImGui::Spacing(); ImGui::Spacing();
 
-    if (ImGui::Button(u8"🔀 生成混淆预览", ImVec2(180, 0))) {
+    if (ImGui::Button(u8"生成混淆预览", ImVec2(180, 0))) {
         Gugas_ObfuscatePassword(g_state.passwordInput,
             g_state.obfuscated, g_state.realMask, &g_state.obfLen);
     }
@@ -1169,7 +1399,7 @@ static void DrawTab3_Password() {
 }
 
 /* -----------------------------------------------------------------------------
- * Tab 4 —— 📋 Hosts 审计
+ * Tab 4 —— Hosts 审计
  * ---------------------------------------------------------------------------*/
 static void DrawTab4_Hosts() {
     if (ImGui::Button(u8"🔄 刷新", ImVec2(140, 0))) RefreshHosts();
@@ -1185,7 +1415,7 @@ static void DrawTab4_Hosts() {
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180);
-    ImGui::InputTextWithHint("##hostsf", u8"🔍 筛选 hosts", g_state.hostsFilter, sizeof(g_state.hostsFilter));
+    ImGui::InputTextWithHint("##hostsf", u8"筛选 hosts", g_state.hostsFilter, sizeof(g_state.hostsFilter));
     ImGui::Spacing();
 
     if (g_state.hosts.empty() && g_state.didInitialScan) {
@@ -1270,7 +1500,7 @@ static void DrawTab4_Hosts() {
 }
 
 /* -----------------------------------------------------------------------------
- * Tab 5 —— ⚙ 白名单/黑名单管理
+ * Tab 5 —— 白名单/黑名单管理
  * ---------------------------------------------------------------------------*/
 static void DrawTab5_Rules() {
     ImGui::TextColored(col::v4(0xc8,0xd0,0xe0), u8"白名单 / 黑名单管理");
@@ -1443,20 +1673,20 @@ static void DrawTab5_Rules() {
 }
 
 /* -----------------------------------------------------------------------------
- * Tab 6 —— 🔍 深度扫描（服务 + 启动项 + 网络连接）
+ * Tab 6 —— 深度扫描（服务 + 启动项 + 网络连接）
  * ---------------------------------------------------------------------------*/
 static void DrawTab6_DeepScan() {
-    if (ImGui::Button(u8"🔄 扫描服务", ImVec2(120, 0))) {
+    if (ImGui::Button(u8"扫描服务", ImVec2(120, 0))) {
         RefreshServices();
     }
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"枚举所有系统服务（需要管理员权限才能获取完整信息）");
     ImGui::SameLine();
-    if (ImGui::Button(u8"🔄 扫描启动项", ImVec2(120, 0))) {
+    if (ImGui::Button(u8"扫描启动项", ImVec2(120, 0))) {
         RefreshStartup();
     }
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"扫描注册表 Run/RunOnce 和启动文件夹");
     ImGui::SameLine();
-    if (ImGui::Button(u8"🔄 扫描网络", ImVec2(120, 0))) {
+    if (ImGui::Button(u8"扫描网络", ImVec2(120, 0))) {
         RefreshNetwork();
     }
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"枚举所有 TCP/UDP 连接及对应进程");
@@ -1467,7 +1697,7 @@ static void DrawTab6_DeepScan() {
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"服务路径位于 Temp/AppData 或名称含敏感词");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180);
-    ImGui::InputTextWithHint("##svcf", u8"🔍 筛选服务", g_state.svcFilter, sizeof(g_state.svcFilter));
+    ImGui::InputTextWithHint("##svcf", u8"筛选服务", g_state.svcFilter, sizeof(g_state.svcFilter));
     ImGui::Separator();
     if (g_state.services.empty()) {
         ImGui::TextDisabled(u8"点击上方按钮开始扫描服务");
@@ -1537,7 +1767,7 @@ static void DrawTab6_DeepScan() {
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"注册表或启动文件夹中的可疑自启动条目");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180);
-    ImGui::InputTextWithHint("##startupf", u8"🔍 筛选启动项", g_state.startupFilter, sizeof(g_state.startupFilter));
+    ImGui::InputTextWithHint("##startupf", u8"筛选启动项", g_state.startupFilter, sizeof(g_state.startupFilter));
     ImGui::Separator();
     if (g_state.startups.empty()) {
         ImGui::TextDisabled(u8"点击上方按钮开始扫描启动项");
@@ -1608,7 +1838,7 @@ static void DrawTab6_DeepScan() {
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"已建立至非常见端口的连接或进程名含敏感词");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(180);
-    ImGui::InputTextWithHint("##connf", u8"🔍 筛选连接", g_state.connFilter, sizeof(g_state.connFilter));
+    ImGui::InputTextWithHint("##connf", u8"筛选连接", g_state.connFilter, sizeof(g_state.connFilter));
     ImGui::Separator();
     if (g_state.connections.empty()) {
         ImGui::TextDisabled(u8"点击上方按钮开始扫描网络连接");
@@ -1697,7 +1927,7 @@ static void DrawTab6_DeepScan() {
 }
 
 /* -----------------------------------------------------------------------------
- * Tab 7 —— 📁 文件系统扫描（多线程硬盘目录扫描 + 盘符选择）
+ * Tab 7 —— 文件系统扫描（多线程硬盘目录扫描 + 盘符选择）
  * ---------------------------------------------------------------------------*/
 static void DrawTab7_FileSystem() {
     /* --- 盘符选择 --- */
@@ -1732,12 +1962,12 @@ static void DrawTab7_FileSystem() {
     for (int i = 0; i < 26; i++) if (g_state.selectedDrives[i]) { hasSelection = true; break; }
 
     ImGui::BeginDisabled(!hasSelection || g_state.fileScanRunning);
-    if (ImGui::Button(u8"🚀 快速扫描", ImVec2(160, 0))) {
+    if (ImGui::Button(u8"快速扫描", ImVec2(160, 0))) {
         RefreshFileSystemScan(GDS_MODE_QUICK);
     }
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"多线程扫描选中盘符的关键目录，最大深度 2 层");
     ImGui::SameLine();
-    if (ImGui::Button(u8"🔥 深度扫描", ImVec2(160, 0))) {
+    if (ImGui::Button(u8"深度扫描", ImVec2(160, 0))) {
         RefreshFileSystemScan(GDS_MODE_DEEP);
     }
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"多线程深度扫描选中盘符，最大深度 4 层，耗时较长");
@@ -1759,7 +1989,7 @@ static void DrawTab7_FileSystem() {
     /* --- 结果表格 --- */
     if (!g_state.fileEntries.empty()) {
         ImGui::SetNextItemWidth(220);
-        ImGui::InputTextWithHint("##filef", u8"🔍 筛选文件", g_state.fileFilter, sizeof(g_state.fileFilter));
+        ImGui::InputTextWithHint("##filef", u8"筛选文件", g_state.fileFilter, sizeof(g_state.fileFilter));
         ImGui::Spacing();
     }
     if (g_state.fileEntries.empty()) {
@@ -1993,13 +2223,15 @@ static void DrawMainWindow() {
     DrawNotifications(ImGui::GetIO().DeltaTime);
 
     if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_None)) {
-        if (ImGui::BeginTabItem(u8"🔍 进程审计"))     { DrawTab1_Processes();    ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(u8"🛡 驱动 & 窗口"))   { DrawTab2_DriversWindows(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(u8"🔑 密码保镖"))     { DrawTab3_Password();     ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(u8"📋 Hosts 审计"))   { DrawTab4_Hosts();        ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(u8"⚙ 白名单/黑名单")) { DrawTab5_Rules();        ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(u8"🔍 深度扫描"))    { DrawTab6_DeepScan();     ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem(u8"📁 文件系统"))    { DrawTab7_FileSystem();   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 进程审计"))     { DrawTab1_Processes();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 驱动 & 窗口"))   { DrawTab2_DriversWindows(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 键盘安全"))     { DrawTab2b_KeyboardSecurity(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 隐匿线程"))     { DrawTab2c_GhostThreads();  ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 密码保镖"))     { DrawTab3_Password();     ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" Hosts 审计"))   { DrawTab4_Hosts();        ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 白名单/黑名单")) { DrawTab5_Rules();        ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 深度扫描"))    { DrawTab6_DeepScan();     ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(u8" 文件系统"))    { DrawTab7_FileSystem();   ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 
@@ -2031,7 +2263,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         CleanupDeviceD3D();
         ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
         MessageBoxW(nullptr,
-            L"DirectX 11 设备创建失败。\n请确保显卡驱动正常且系统支持 DX11。",
+            L"DirectX 11 创建失败。\n请确保显卡驱动正常且系统支持 DX11。",
             L"Gugas 启动错误", MB_OK | MB_ICONERROR);
         return 1;
     }
