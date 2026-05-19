@@ -94,18 +94,14 @@ static const char* SKIP_EXTS[] = {
 };
 #define SKIP_EXT_COUNT ((int)(sizeof(SKIP_EXTS)/sizeof(SKIP_EXTS[0])))
 
-static int cmp_str_ptr(const void* a, const void* b) {
-    return strcmp(*(const char* const*)a, *(const char* const*)b);
-}
-
-/* 扩展名是否可直接跳过（减少 90% 以上不必要的字符串处理） */
+/* 扩展名是否可直接跳过（线性查找，50+ 项，开销可忽略） */
 static int is_skippable_ext(const char* ext) {
     if (!ext || ext[0] != '.') return 1;  /* 无扩展名 → 跳过 */
     char el[16];
     str_to_lower_copy(ext, el, sizeof(el));
-    void* found = bsearch(&el, SKIP_EXTS, SKIP_EXT_COUNT,
-                          sizeof(char*), cmp_str_ptr);
-    return found != NULL;
+    for (int i = 0; i < SKIP_EXT_COUNT; i++)
+        if (strcmp(el, SKIP_EXTS[i]) == 0) return 1;
+    return 0;
 }
 
 /* 可执行/脚本扩展名检测 */
