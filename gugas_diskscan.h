@@ -73,6 +73,33 @@ static inline void gds_atomic_fence(void) {
 }
 
 /* ---------------------------------------------------------------------------
+ * PE 文件头信息（从磁盘读取）
+ * ---------------------------------------------------------------------------*/
+typedef struct {
+    WORD    machine;          /* IMAGE_FILE_MACHINE_* */
+    WORD    subsystem;        /* IMAGE_SUBSYSTEM_* */
+    DWORD   timestamp;        /* TimeDateStamp */
+    WORD    characteristics;  /* IMAGE_FILE_* */
+    WORD    numSections;
+    DWORD   entryPoint;
+    DWORD   imageBase32;
+    ULONGLONG imageBase64;
+    int     isPE;             /* 1 = 有效的 PE 文件 */
+    int     is64Bit;          /* 1 = PE32+ */
+    int     hasCertDir;       /* 证书目录存在 */
+} GdsPEHeader;
+
+/* 签名验证结果 */
+typedef enum {
+    GDS_SIG_UNKNOWN = 0,   /* 未检查 */
+    GDS_SIG_UNSIGNED,      /* 无签名 */
+    GDS_SIG_VALID,         /* 签名有效 */
+    GDS_SIG_INVALID,       /* 签名无效/被篡改 */
+    GDS_SIG_UNTRUSTED,     /* 签名不受信任 */
+    GDS_SIG_ERROR          /* 检查出错 */
+} GdsSigResult;
+
+/* ---------------------------------------------------------------------------
  * 扫描结果条目
  * ---------------------------------------------------------------------------*/
 typedef struct {
@@ -84,6 +111,12 @@ typedef struct {
     FILETIME  writeTime;
     int       isSuspicious;
     char      reason[256];
+
+    /* PE 头信息 */
+    GdsPEHeader pe;
+    GdsSigResult sigResult;
+    char      signerName[256];  /* 签名者名称（如果有） */
+    float     entropy;          /* 文件熵值（0.0-8.0），越高越可能加壳 */
 } GdsFileEntry;
 
 /* ---------------------------------------------------------------------------

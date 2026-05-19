@@ -1,16 +1,7 @@
 /* =============================================================================
- * gugas_diskscan.c —— 磁盘扫描模块（多线程 + 内联汇编原子控制 + I/O 优化）
- *
- * 优化策略：
- *   1. 扩展名预过滤：非可执行/脚本扩展名直接跳过，不构造完整路径
- *   2. 目录黑名单：跳过系统回收站、卷影复制等无意义目录
- *   3. FindFirstFileExA + FindExInfoBasic：减少内核返回数据量
- *   4. I/O 优先级降级：后台线程模式，降低对前台程序影响
- *   5. 并发线程限制：最多 4 个并发线程，避免 I/O 风暴
- *   6. 取消检查：原子读取取消标志，快速退出
+ * gugas_diskscan.c
  *
  * Copyright (c) 2026 zayoka
- * MIT License
  * =============================================================================
  */
 
@@ -22,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 /* MinGW 可能缺少的常量 */
 #ifndef FindExInfoBasic
@@ -77,7 +69,200 @@ static int str_icontains(const char* haystack, const char* needleLower) {
 }
 
 /* =============================================================================
- * 扩展名快速过滤（排序数组 + bsearch）
+ * PE 文件头解析
+ * =============================================================================
+ */
+
+/* 简化的 PE 结构（与 Windows SDK 兼容） */
+#pragma pack(push, 1)
+typedef struct {
+    WORD  e_magic; WORD  e_cblp; WORD  e_cp; WORD  e_crlc;
+    WORD  e_cparhdr; WORD  e_minalloc; WORD  e_maxalloc;
+    WORD  e_ss; WORD  e_sp; WORD  e_csum; WORD  e_ip;
+    WORD  e_cs; WORD  e_lfarlc; WORD  e_ovno;
+    WORD  e_res[4]; WORD  e_oemid; WORD  e_oeminfo;
+    WORD  e_res2[10]; LONG  e_lfanew;
+} GDS_IMAGE_DOS_HEADER;
+
+typedef struct {
+    WORD  Machine; WORD  NumberOfSections;
+    DWORD TimeDateStamp; DWORD PointerToSymbolTable;
+    DWORD NumberOfSymbols; WORD  SizeOfOptionalHeader;
+    WORD  Characteristics;
+} GDS_IMAGE_FILE_HEADER;
+
+typedef struct { DWORD VirtualAddress; DWORD Size; } GDS_IMAGE_DATA_DIRECTORY;
+
+typedef struct {
+    WORD  Magic; BYTE  MajorLinkerVersion; BYTE  MinorLinkerVersion;
+    DWORD SizeOfCode; DWORD SizeOfInitializedData;
+    DWORD SizeOfUninitializedData; DWORD AddressOfEntryPoint;
+    DWORD BaseOfCode; DWORD BaseOfData; DWORD ImageBase;
+    DWORD SectionAlignment; DWORD FileAlignment;
+    WORD  MajorOperatingSystemVersion; WORD  MinorOperatingSystemVersion;
+    WORD  MajorImageVersion; WORD  MinorImageVersion;
+    WORD  MajorSubsystemVersion; WORD  MinorSubsystemVersion;
+    DWORD Win32VersionValue; DWORD SizeOfImage;
+    DWORD SizeOfHeaders; DWORD CheckSum;
+    WORD  Subsystem; WORD  DllCharacteristics;
+    DWORD SizeOfStackReserve; DWORD SizeOfStackCommit;
+    DWORD SizeOfHeapReserve; DWORD SizeOfHeapCommit;
+    DWORD LoaderFlags; DWORD NumberOfRvaAndSizes;
+    GDS_IMAGE_DATA_DIRECTORY DataDirectory[16];
+} GDS_IMAGE_OPTIONAL_HEADER32;
+
+typedef struct {
+    WORD  Magic; BYTE  MajorLinkerVersion; BYTE  MinorLinkerVersion;
+    DWORD SizeOfCode; DWORD SizeOfInitializedData;
+    DWORD SizeOfUninitializedData; DWORD AddressOfEntryPoint;
+    DWORD BaseOfCode; ULONGLONG ImageBase;
+    DWORD SectionAlignment; DWORD FileAlignment;
+    WORD  MajorOperatingSystemVersion; WORD  MinorOperatingSystemVersion;
+    WORD  MajorImageVersion; WORD  MinorImageVersion;
+    WORD  MajorSubsystemVersion; WORD  MinorSubsystemVersion;
+    DWORD Win32VersionValue; DWORD SizeOfImage;
+    DWORD SizeOfHeaders; DWORD CheckSum;
+    WORD  Subsystem; WORD  DllCharacteristics;
+    ULONGLONG SizeOfStackReserve; ULONGLONG SizeOfStackCommit;
+    ULONGLONG SizeOfHeapReserve; ULONGLONG SizeOfHeapCommit;
+    DWORD LoaderFlags; DWORD NumberOfRvaAndSizes;
+    GDS_IMAGE_DATA_DIRECTORY DataDirectory[16];
+} GDS_IMAGE_OPTIONAL_HEADER64;
+
+typedef struct {
+    DWORD Signature;
+    GDS_IMAGE_FILE_HEADER FileHeader;
+} GDS_IMAGE_NT_HEADERS;
+#pragma pack(pop)
+
+#define GDS_IMAGE_DOS_SIGNATURE  0x5A4D
+#define GDS_IMAGE_NT_SIGNATURE   0x00004550
+#define GDS_IMAGE_NT_OPTIONAL_HDR32_MAGIC 0x10b
+#define GDS_IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
+
+/* 读取文件前 8KB 并解析 PE 头 */
+static int gds_read_pe_header(const char* path, GdsPEHeader* out) {
+    memset(out, 0, sizeof(*out));
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                                NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return 0;
+
+    BYTE buf[8192];
+    DWORD read = 0;
+    if (!ReadFile(hFile, buf, sizeof(buf), &read, NULL) || read < 128) {
+        CloseHandle(hFile); return 0;
+    }
+    CloseHandle(hFile);
+
+    GDS_IMAGE_DOS_HEADER* dos = (GDS_IMAGE_DOS_HEADER*)buf;
+    if (dos->e_magic != GDS_IMAGE_DOS_SIGNATURE) return 0;
+
+    LONG peOff = dos->e_lfanew;
+    if (peOff < 0 || (size_t)(peOff + 4) > read) return 0;
+
+    DWORD* peSig = (DWORD*)(buf + peOff);
+    if (*peSig != GDS_IMAGE_NT_SIGNATURE) return 0;
+
+    GDS_IMAGE_NT_HEADERS* nth = (GDS_IMAGE_NT_HEADERS*)(buf + peOff);
+    out->isPE  = 1;
+    out->machine = nth->FileHeader.Machine;
+    out->timestamp = nth->FileHeader.TimeDateStamp;
+    out->characteristics = nth->FileHeader.Characteristics;
+    out->numSections = nth->FileHeader.NumberOfSections;
+
+    WORD optMagic = *(WORD*)((BYTE*)nth + sizeof(GDS_IMAGE_NT_HEADERS));
+    if (optMagic == GDS_IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        out->is64Bit = 1;
+        GDS_IMAGE_OPTIONAL_HEADER64* opt =
+            (GDS_IMAGE_OPTIONAL_HEADER64*)((BYTE*)nth + sizeof(GDS_IMAGE_NT_HEADERS));
+        out->subsystem   = opt->Subsystem;
+        out->entryPoint = opt->AddressOfEntryPoint;
+        out->imageBase64 = opt->ImageBase;
+        out->hasCertDir = (opt->DataDirectory[4].VirtualAddress != 0 &&
+                           opt->DataDirectory[4].Size != 0);
+    } else if (optMagic == GDS_IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        GDS_IMAGE_OPTIONAL_HEADER32* opt =
+            (GDS_IMAGE_OPTIONAL_HEADER32*)((BYTE*)nth + sizeof(GDS_IMAGE_NT_HEADERS));
+        out->subsystem   = opt->Subsystem;
+        out->entryPoint = opt->AddressOfEntryPoint;
+        out->imageBase32 = opt->ImageBase;
+        out->hasCertDir = (opt->DataDirectory[4].VirtualAddress != 0 &&
+                           opt->DataDirectory[4].Size != 0);
+    }
+    return 1;
+}
+
+/* 计算文件熵值（0.0 - 8.0），读取前 64KB 采样 */
+static float gds_calc_entropy(const char* path) {
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                                NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return 0.0f;
+
+    DWORD freq[256] = {0};
+    BYTE buf[4096];
+    DWORD total = 0;
+    while (total < 65536) {
+        DWORD rd = 0;
+        if (!ReadFile(hFile, buf, sizeof(buf), &rd, NULL) || rd == 0) break;
+        for (DWORD i = 0; i < rd; i++) freq[buf[i]]++;
+        total += rd;
+    }
+    CloseHandle(hFile);
+    if (total == 0) return 0.0f;
+
+    double entropy = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] == 0) continue;
+        double p = (double)freq[i] / (double)total;
+        entropy -= p * log2(p);
+    }
+    return (float)entropy;
+}
+
+/* =============================================================================
+ * 数字签名验证（WinVerifyTrust）
+ * =============================================================================
+ */
+#include <wintrust.h>
+#include <softpub.h>
+
+static GdsSigResult gds_verify_signature(const char* path) {
+    wchar_t wpath[MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) == 0)
+        return GDS_SIG_ERROR;
+
+    WINTRUST_FILE_INFO fileInfo = {0};
+    fileInfo.cbStruct = sizeof(fileInfo);
+    fileInfo.pcwszFilePath = wpath;
+
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA trustData = {0};
+    trustData.cbStruct = sizeof(trustData);
+    trustData.dwUIChoice = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+    trustData.pFile = &fileInfo;
+    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    trustData.dwProvFlags = WTD_SAFER_FLAG;
+
+    LONG status = WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &trustData);
+
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &trustData);
+
+    if (status == ERROR_SUCCESS)         return GDS_SIG_VALID;
+    if (status == TRUST_E_NOSIGNATURE)   return GDS_SIG_UNSIGNED;
+    if (status == TRUST_E_EXPLICIT_DISTRUST) return GDS_SIG_UNTRUSTED;
+    if (status == CRYPT_E_SECURITY_SETTINGS)   return GDS_SIG_UNTRUSTED;
+    return GDS_SIG_INVALID;
+}
+
+/* =============================================================================
+ * 扩展名快速过滤
  * =============================================================================
  */
 
@@ -299,7 +484,7 @@ static int scan_dir_recurse(const char* root,
             if (suspicious) {
                 GdsFileEntry* dst = &outList[*outCount];
                 memset(dst, 0, sizeof(*dst));
-                /* 重新构造完整路径（之前为了省栈空间在 if 内构造） */
+                /* 重新构造完整路径 */
                 snprintf(dst->path, sizeof(dst->path), "%s\\%s", cur, name);
                 strncpy(dst->name, name, sizeof(dst->name) - 1);
                 dst->attributes   = fd.dwFileAttributes;
@@ -308,6 +493,41 @@ static int scan_dir_recurse(const char* root,
                 dst->writeTime    = fd.ftLastWriteTime;
                 dst->isSuspicious = 1;
                 strncpy(dst->reason, reason, sizeof(dst->reason) - 1);
+
+                /* 读取 PE 头、熵值、签名（只对可疑可执行文件） */
+                if (isExec) {
+                    gds_read_pe_header(dst->path, &dst->pe);
+                    dst->entropy = gds_calc_entropy(dst->path);
+                    if (dst->pe.hasCertDir)
+                        dst->sigResult = gds_verify_signature(dst->path);
+                    else
+                        dst->sigResult = GDS_SIG_UNSIGNED;
+
+                    /* 熵值过高（>= 7.5）追加可疑原因 */
+                    if (dst->entropy >= 7.5f) {
+                        char tmp[512];
+                        snprintf(tmp, sizeof(tmp), "%s | 高熵值 %.2f（可能加壳/加密）",
+                                 dst->reason, dst->entropy);
+                        strncpy(dst->reason, tmp, sizeof(dst->reason) - 1);
+                        dst->reason[sizeof(dst->reason) - 1] = '\0';
+                    }
+                    /* 无签名追加提示 */
+                    if (dst->sigResult == GDS_SIG_UNSIGNED) {
+                        char tmp[512];
+                        snprintf(tmp, sizeof(tmp), "%s | 无数字签名", dst->reason);
+                        strncpy(dst->reason, tmp, sizeof(dst->reason) - 1);
+                        dst->reason[sizeof(dst->reason) - 1] = '\0';
+                    }
+                    /* 签名无效追加提示 */
+                    if (dst->sigResult == GDS_SIG_INVALID ||
+                        dst->sigResult == GDS_SIG_UNTRUSTED) {
+                        char tmp[512];
+                        snprintf(tmp, sizeof(tmp), "%s | 签名无效/不受信任", dst->reason);
+                        strncpy(dst->reason, tmp, sizeof(dst->reason) - 1);
+                        dst->reason[sizeof(dst->reason) - 1] = '\0';
+                    }
+                }
+
                 (*outCount)++;
                 if (prog) gds_atomic_inc(&prog->filesSuspicious);
             }

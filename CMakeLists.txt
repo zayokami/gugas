@@ -76,6 +76,9 @@ target_link_libraries(gugas_core PRIVATE
     iphlpapi
     shell32
     ws2_32
+    wintrust
+    crypt32
+    m
 )
 
 set_target_properties(gugas_core PROPERTIES

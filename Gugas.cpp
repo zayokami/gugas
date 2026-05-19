@@ -224,7 +224,7 @@ struct AppState {
     std::vector<ServiceInfo>   services;
     std::vector<StartupEntry>  startups;
     std::vector<ConnectionInfo> connections;
-    std::vector<FileEntry>     fileEntries;
+    std::vector<GdsFileEntry>  fileEntries;
 
     char passwordInput[256] = {0};
     char obfuscated[1024]   = {0};
@@ -476,7 +476,7 @@ static void RefreshNetwork() {
 }
 
 static void RefreshFileSystemScan(GdsScanMode mode) {
-    static FileEntry buf[8192];
+    static GdsFileEntry buf[8192];
 
     /* 收集选中的盘符 */
     char drives[26];
@@ -1475,13 +1475,14 @@ static void DrawTab7_FileSystem() {
         ImGui::TextDisabled(u8"选择盘符后点击扫描按钮开始文件系统扫描");
     } else {
         ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 16);
-        if (ImGui::BeginTable("##files", 4,
+        if (ImGui::BeginTable("##files", 5,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, sz)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn(u8"文件名",       ImGuiTableColumnFlags_WidthFixed, 220.0f);
+            ImGui::TableSetupColumn(u8"文件名",       ImGuiTableColumnFlags_WidthFixed, 200.0f);
             ImGui::TableSetupColumn(u8"完整路径",     ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn(u8"大小",         ImGuiTableColumnFlags_WidthFixed, 100.0f);
-            ImGui::TableSetupColumn(u8"触发原因",     ImGuiTableColumnFlags_WidthFixed, 240.0f);
+            ImGui::TableSetupColumn(u8"大小",         ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn(u8"PE 信息",      ImGuiTableColumnFlags_WidthFixed, 160.0f);
+            ImGui::TableSetupColumn(u8"触发原因",     ImGuiTableColumnFlags_WidthFixed, 280.0f);
             ImGui::TableHeadersRow();
             for (auto& f : g_state.fileEntries) {
                 if (!f.isSuspicious) continue;
@@ -1495,6 +1496,44 @@ static void DrawTab7_FileSystem() {
                 } else {
                     ImGui::Text("%llu B",
                         ((unsigned long long)f.sizeHigh << 32) | f.sizeLow);
+                }
+                /* PE 信息列：架构 + 签名 + 熵值 */
+                ImGui::TableNextColumn();
+                if (f.pe.isPE) {
+                    /* 架构 */
+                    const char* arch = "?";
+                    if (f.pe.machine == 0x014c) arch = "x86";
+                    else if (f.pe.machine == 0x8664) arch = "x64";
+                    else if (f.pe.machine == 0xaa64) arch = "ARM64";
+                    else if (f.pe.machine == 0x01c0) arch = "ARM";
+                    ImGui::Text("%s%s", arch, f.pe.is64Bit ? "+" : "");
+                    /* 签名 */
+                    ImGui::SameLine();
+                    switch (f.sigResult) {
+                        case GDS_SIG_VALID:
+                            ImGui::TextColored(col::v4(0x00,0xff,0x9f), u8" 已签");
+                            break;
+                        case GDS_SIG_UNSIGNED:
+                            ImGui::TextColored(col::v4(0xff,0xaa,0x00), u8" 无签");
+                            break;
+                        case GDS_SIG_INVALID:
+                        case GDS_SIG_UNTRUSTED:
+                            ImGui::TextColored(col::v4(0xff,0x44,0x44), u8" 无效");
+                            break;
+                        default:
+                            ImGui::TextDisabled(u8" -");
+                    }
+                    /* 熵值 */
+                    if (f.entropy > 0.0f) {
+                        ImGui::SameLine();
+                        ImU32 ec = (f.entropy >= 7.0f) ? col::DANGER :
+                                   (f.entropy >= 6.0f) ? col::WARN_AMBER :
+                                   col::DIM_TEXT;
+                        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(ec),
+                            " H%.1f", f.entropy);
+                    }
+                } else {
+                    ImGui::TextDisabled(u8"非 PE");
                 }
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(f.reason);
             }
