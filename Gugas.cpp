@@ -252,6 +252,16 @@ struct AppState {
     bool selectedDrives[26] = {false};
     int  selectedDriveCount = 0;
     GdsProgress fileProgress = {0};
+
+    /* 筛选关键词 */
+    char procFilter[128]    = {0};
+    char driverFilter[128]  = {0};
+    char windowFilter[128]  = {0};
+    char hostsFilter[128]   = {0};
+    char svcFilter[128]     = {0};
+    char startupFilter[128] = {0};
+    char connFilter[128]    = {0};
+    char fileFilter[128]    = {0};
 };
 
 static AppState g_state;
@@ -272,6 +282,17 @@ static const char* tcp_state_str(DWORD state) {
         case 12: return "DELETE";
         default: return "UNKNOWN";
     }
+}
+
+/* 不区分大小写子串匹配；needle 为空时恒为 true */
+static bool str_icontains(const char* haystack, const char* needle) {
+    if (!needle || !needle[0]) return true;
+    if (!haystack) return false;
+    size_t nlen = strlen(needle);
+    for (const char* p = haystack; *p; ++p) {
+        if (_strnicmp(p, needle, nlen) == 0) return true;
+    }
+    return false;
 }
 
 /* -----------------------------------------------------------------------------
@@ -695,6 +716,9 @@ static void DrawTab1_Processes() {
         for (auto& p : g_state.procs) if (p.isSuspicious) sus++;
         ImGui::TextDisabled(u8"共 %zu 个进程，%zu 项可疑", g_state.procs.size(), sus);
     }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##procf", u8"🔍 筛选进程", g_state.procFilter, sizeof(g_state.procFilter));
     ImGui::Spacing();
 
     if (g_state.procs.empty() && g_state.didInitialScan) {
@@ -705,8 +729,9 @@ static void DrawTab1_Processes() {
     }
 
     if (ImGui::BeginTable("##split", 2,
-            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable,
-            ImVec2(-1, -1))) {
+            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX,
+            ImVec2(-1, ImGui::GetContentRegionAvail().y))) {
         ImGui::TableSetupColumn("LeftAll");
         ImGui::TableSetupColumn("RightSuspicious");
         ImGui::TableNextRow();
@@ -716,16 +741,46 @@ static void DrawTab1_Processes() {
         ImGui::Separator();
         if (ImGui::BeginTable("##all", 5,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
-                ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti,
                 ImVec2(-1, -1))) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("PID",  ImGuiTableColumnFlags_WidthFixed, 60.0f);
-            ImGui::TableSetupColumn(u8"进程名", ImGuiTableColumnFlags_WidthFixed, 180.0f);
-            ImGui::TableSetupColumn(u8"路径", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn(u8"状态", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-            ImGui::TableSetupColumn(u8"操作",  ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("PID",  ImGuiTableColumnFlags_WidthFixed, 60.0f, 0);
+            ImGui::TableSetupColumn(u8"进程名", ImGuiTableColumnFlags_WidthFixed, 180.0f, 1);
+            ImGui::TableSetupColumn(u8"路径", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
+            ImGui::TableSetupColumn(u8"状态", ImGuiTableColumnFlags_WidthFixed, 80.0f, 3);
+            ImGui::TableSetupColumn(u8"操作",  ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 80.0f, 4);
             ImGui::TableHeadersRow();
+
+            if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                if (sort_specs->SpecsDirty) {
+                    std::sort(g_state.procs.begin(), g_state.procs.end(),
+                        [&](const ProcessInfo& a, const ProcessInfo& b) {
+                            for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                const auto& spec = sort_specs->Specs[n];
+                                int delta = 0;
+                                switch (spec.ColumnUserID) {
+                                    case 0: delta = (int)a.pid - (int)b.pid; break;
+                                    case 1: delta = _stricmp(a.name, b.name); break;
+                                    case 2: delta = _stricmp(a.fullPath, b.fullPath); break;
+                                    case 3: delta = (int)b.isSuspicious - (int)a.isSuspicious; break;
+                                }
+                                if (delta != 0)
+                                    return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                            }
+                            return false;
+                        });
+                    sort_specs->SpecsDirty = false;
+                }
+
             for (auto& p : g_state.procs) {
+                if (g_state.procFilter[0]) {
+                    char pidStr[32]; snprintf(pidStr, sizeof(pidStr), "%lu", (unsigned long)p.pid);
+                    if (!str_icontains(pidStr, g_state.procFilter) &&
+                        !str_icontains(p.name, g_state.procFilter) &&
+                        !str_icontains(p.fullPath, g_state.procFilter))
+                        continue;
+                }
                 ImGui::TableNextRow();
                 if (p.isSuspicious) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
                 ImGui::TableNextColumn(); ImGui::Text("%lu", (unsigned long)p.pid);
@@ -753,17 +808,46 @@ static void DrawTab1_Processes() {
         ImGui::Separator();
         if (ImGui::BeginTable("##sus", 4,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
-                ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti,
                 ImVec2(-1, -1))) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("PID",      ImGuiTableColumnFlags_WidthFixed, 60.0f);
-            ImGui::TableSetupColumn(u8"进程名", ImGuiTableColumnFlags_WidthFixed, 180.0f);
-            ImGui::TableSetupColumn(u8"触发原因", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn(u8"操作",    ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("PID",      ImGuiTableColumnFlags_WidthFixed, 60.0f, 0);
+            ImGui::TableSetupColumn(u8"进程名", ImGuiTableColumnFlags_WidthFixed, 180.0f, 1);
+            ImGui::TableSetupColumn(u8"触发原因", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
+            ImGui::TableSetupColumn(u8"操作",    ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 80.0f, 3);
             ImGui::TableHeadersRow();
+
+            if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                if (sort_specs->SpecsDirty) {
+                    std::sort(g_state.procs.begin(), g_state.procs.end(),
+                        [&](const ProcessInfo& a, const ProcessInfo& b) {
+                            for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                const auto& spec = sort_specs->Specs[n];
+                                int delta = 0;
+                                switch (spec.ColumnUserID) {
+                                    case 0: delta = (int)a.pid - (int)b.pid; break;
+                                    case 1: delta = _stricmp(a.name, b.name); break;
+                                    case 2: delta = _stricmp(a.reason, b.reason); break;
+                                }
+                                if (delta != 0)
+                                    return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                            }
+                            return false;
+                        });
+                    sort_specs->SpecsDirty = false;
+                }
+
             bool anySus = false;
             for (auto& p : g_state.procs) {
                 if (!p.isSuspicious) continue;
+                if (g_state.procFilter[0]) {
+                    char pidStr[32]; snprintf(pidStr, sizeof(pidStr), "%lu", (unsigned long)p.pid);
+                    if (!str_icontains(pidStr, g_state.procFilter) &&
+                        !str_icontains(p.name, g_state.procFilter) &&
+                        !str_icontains(p.reason, g_state.procFilter))
+                        continue;
+                }
                 anySus = true;
                 ImGui::TableNextRow();
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
@@ -805,6 +889,9 @@ static void DrawTab2_DriversWindows() {
     /* 可疑驱动 */
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::DANGER), u8"⚠ 可疑驱动");
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"需要管理员权限才能列出完整的内核驱动列表");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##drvfilter", u8"🔍 筛选驱动", g_state.driverFilter, sizeof(g_state.driverFilter));
     ImGui::Separator();
     if (g_state.drivers.empty() && g_state.didInitialScan) {
         ImGui::TextColored(col::v4(0xff,0x44,0x44), u8"⚠ 驱动扫描失败或权限不足");
@@ -816,16 +903,42 @@ static void DrawTab2_DriversWindows() {
                 u8"✓ 未检测到可疑驱动（已扫描 %zu 个已加载内核驱动）",
                 g_state.drivers.size());
         } else {
-            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 6);
+            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 10);
             if (ImGui::BeginTable("##drv", 3,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, sz)) {
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                    ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, sz)) {
                 ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn(u8"驱动名", ImGuiTableColumnFlags_WidthFixed, 220.0f);
-                ImGui::TableSetupColumn(u8"触发原因", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn(u8"操作",    ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn(u8"驱动名", ImGuiTableColumnFlags_WidthFixed, 220.0f, 0);
+                ImGui::TableSetupColumn(u8"触发原因", ImGuiTableColumnFlags_WidthStretch, 0.0f, 1);
+                ImGui::TableSetupColumn(u8"操作",    ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 80.0f, 2);
                 ImGui::TableHeadersRow();
+
+                if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                    if (sort_specs->SpecsDirty) {
+                        std::sort(g_state.drivers.begin(), g_state.drivers.end(),
+                            [&](const DriverInfo& a, const DriverInfo& b) {
+                                for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                    const auto& spec = sort_specs->Specs[n];
+                                    int delta = 0;
+                                    switch (spec.ColumnUserID) {
+                                        case 0: delta = _stricmp(a.name, b.name); break;
+                                        case 1: delta = _stricmp(a.reason, b.reason); break;
+                                    }
+                                    if (delta != 0)
+                                        return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                                }
+                                return false;
+                            });
+                        sort_specs->SpecsDirty = false;
+                    }
+
                 for (auto& d : g_state.drivers) {
                     if (!d.isSuspicious) continue;
+                    if (g_state.driverFilter[0] &&
+                        !str_icontains(d.name, g_state.driverFilter) &&
+                        !str_icontains(d.reason, g_state.driverFilter))
+                        continue;
                     ImGui::TableNextRow();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(d.name);
@@ -849,6 +962,9 @@ static void DrawTab2_DriversWindows() {
 
     /* 可疑覆盖层窗口 */
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::DANGER), u8"⚠ 疑似覆盖层窗口");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##wndfilter", u8"🔍 筛选窗口", g_state.windowFilter, sizeof(g_state.windowFilter));
     ImGui::Separator();
     if (g_state.windows.empty() && g_state.didInitialScan) {
         ImGui::TextColored(col::v4(0xff,0x44,0x44), u8"⚠ 窗口扫描失败");
@@ -858,16 +974,46 @@ static void DrawTab2_DriversWindows() {
     } else {
         if (ImGui::BeginTable("##wnd", 6,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
-                ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(-1, -1))) {
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, ImVec2(-1, -1))) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn(u8"窗口标题",   ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn(u8"所属进程",   ImGuiTableColumnFlags_WidthFixed, 160.0f);
-            ImGui::TableSetupColumn(u8"尺寸",       ImGuiTableColumnFlags_WidthFixed, 100.0f);
-            ImGui::TableSetupColumn(u8"窗口类名",   ImGuiTableColumnFlags_WidthFixed, 160.0f);
-            ImGui::TableSetupColumn(u8"触发原因",   ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn(u8"操作",       ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn(u8"窗口标题",   ImGuiTableColumnFlags_WidthStretch, 0.0f, 0);
+            ImGui::TableSetupColumn(u8"所属进程",   ImGuiTableColumnFlags_WidthFixed, 160.0f, 1);
+            ImGui::TableSetupColumn(u8"尺寸",       ImGuiTableColumnFlags_WidthFixed, 100.0f, 2);
+            ImGui::TableSetupColumn(u8"窗口类名",   ImGuiTableColumnFlags_WidthFixed, 160.0f, 3);
+            ImGui::TableSetupColumn(u8"触发原因",   ImGuiTableColumnFlags_WidthStretch, 0.0f, 4);
+            ImGui::TableSetupColumn(u8"操作",       ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 80.0f, 5);
             ImGui::TableHeadersRow();
+
+            if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                if (sort_specs->SpecsDirty) {
+                    std::sort(g_state.windows.begin(), g_state.windows.end(),
+                        [&](const WindowInfo& a, const WindowInfo& b) {
+                            for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                const auto& spec = sort_specs->Specs[n];
+                                int delta = 0;
+                                switch (spec.ColumnUserID) {
+                                    case 0: delta = _stricmp(a.title, b.title); break;
+                                    case 1: delta = _stricmp(a.ownerProcess, b.ownerProcess); break;
+                                    case 2: delta = (a.width * a.height) - (b.width * b.height); break;
+                                    case 3: delta = _stricmp(a.className, b.className); break;
+                                    case 4: delta = _stricmp(a.reason, b.reason); break;
+                                }
+                                if (delta != 0)
+                                    return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                            }
+                            return false;
+                        });
+                    sort_specs->SpecsDirty = false;
+                }
+
             for (auto& w : g_state.windows) {
+                if (g_state.windowFilter[0] &&
+                    !str_icontains(w.title, g_state.windowFilter) &&
+                    !str_icontains(w.ownerProcess, g_state.windowFilter) &&
+                    !str_icontains(w.className, g_state.windowFilter) &&
+                    !str_icontains(w.reason, g_state.windowFilter))
+                    continue;
                 ImGui::TableNextRow();
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(w.title[0] ? w.title : "(无标题)");
@@ -1037,6 +1183,9 @@ static void DrawTab4_Hosts() {
         for (auto& h : g_state.hosts) if (h.isSuspicious) susCount++;
         ImGui::TextDisabled(u8"共 %zu 条 hosts 记录，%zu 项可疑", g_state.hosts.size(), susCount);
     }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##hostsf", u8"🔍 筛选 hosts", g_state.hostsFilter, sizeof(g_state.hostsFilter));
     ImGui::Spacing();
 
     if (g_state.hosts.empty() && g_state.didInitialScan) {
@@ -1048,16 +1197,44 @@ static void DrawTab4_Hosts() {
 
     if (ImGui::BeginTable("##hosts", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
-            ImVec2(-1, -180))) {
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
+            ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti,
+            ImVec2(-1, ImGui::GetTextLineHeightWithSpacing() * 10))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn(u8"IP 地址",   ImGuiTableColumnFlags_WidthFixed, 140.0f);
-        ImGui::TableSetupColumn(u8"域名",      ImGuiTableColumnFlags_WidthFixed, 220.0f);
-        ImGui::TableSetupColumn(u8"原始行内容",ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(u8"风险说明",  ImGuiTableColumnFlags_WidthFixed, 220.0f);
-        ImGui::TableSetupColumn(u8"操作",      ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn(u8"IP 地址",   ImGuiTableColumnFlags_WidthFixed, 140.0f, 0);
+        ImGui::TableSetupColumn(u8"域名",      ImGuiTableColumnFlags_WidthFixed, 220.0f, 1);
+        ImGui::TableSetupColumn(u8"原始行内容",ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
+        ImGui::TableSetupColumn(u8"风险说明",  ImGuiTableColumnFlags_WidthFixed, 220.0f, 3);
+        ImGui::TableSetupColumn(u8"操作",      ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 80.0f, 4);
         ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+            if (sort_specs->SpecsDirty) {
+                std::sort(g_state.hosts.begin(), g_state.hosts.end(),
+                    [&](const HostsEntry& a, const HostsEntry& b) {
+                        for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                            const auto& spec = sort_specs->Specs[n];
+                            int delta = 0;
+                            switch (spec.ColumnUserID) {
+                                case 0: delta = _stricmp(a.ip, b.ip); break;
+                                case 1: delta = _stricmp(a.domain, b.domain); break;
+                                case 2: delta = _stricmp(a.rawLine, b.rawLine); break;
+                                case 3: delta = (int)b.isSuspicious - (int)a.isSuspicious; break;
+                            }
+                            if (delta != 0)
+                                return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                        }
+                        return false;
+                    });
+                sort_specs->SpecsDirty = false;
+            }
+
         for (auto& h : g_state.hosts) {
+            if (g_state.hostsFilter[0] &&
+                !str_icontains(h.ip, g_state.hostsFilter) &&
+                !str_icontains(h.domain, g_state.hostsFilter) &&
+                !str_icontains(h.rawLine, g_state.hostsFilter))
+                continue;
             ImGui::TableNextRow();
             if (h.isSuspicious) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
             ImGui::TableNextColumn();
@@ -1288,6 +1465,9 @@ static void DrawTab6_DeepScan() {
     /* --- 服务 --- */
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::DANGER), u8"⚠ 可疑服务");
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"服务路径位于 Temp/AppData 或名称含敏感词");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##svcf", u8"🔍 筛选服务", g_state.svcFilter, sizeof(g_state.svcFilter));
     ImGui::Separator();
     if (g_state.services.empty()) {
         ImGui::TextDisabled(u8"点击上方按钮开始扫描服务");
@@ -1298,17 +1478,46 @@ static void DrawTab6_DeepScan() {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::OK_GREEN),
                 u8"✓ 未检测到可疑服务（已扫描 %zu 个）", g_state.services.size());
         } else {
-            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 5);
+            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 8);
             if (ImGui::BeginTable("##svc", 4,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, sz)) {
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                    ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, sz)) {
                 ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn(u8"服务名",     ImGuiTableColumnFlags_WidthFixed, 220.0f);
-                ImGui::TableSetupColumn(u8"显示名称",   ImGuiTableColumnFlags_WidthFixed, 280.0f);
-                ImGui::TableSetupColumn(u8"触发原因",   ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn(u8"PID",        ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                ImGui::TableSetupColumn(u8"服务名",     ImGuiTableColumnFlags_WidthFixed, 220.0f, 0);
+                ImGui::TableSetupColumn(u8"显示名称",   ImGuiTableColumnFlags_WidthFixed, 280.0f, 1);
+                ImGui::TableSetupColumn(u8"触发原因",   ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
+                ImGui::TableSetupColumn(u8"PID",        ImGuiTableColumnFlags_WidthFixed, 60.0f, 3);
                 ImGui::TableHeadersRow();
+
+                if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                    if (sort_specs->SpecsDirty) {
+                        std::sort(g_state.services.begin(), g_state.services.end(),
+                            [&](const ServiceInfo& a, const ServiceInfo& b) {
+                                for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                    const auto& spec = sort_specs->Specs[n];
+                                    int delta = 0;
+                                    switch (spec.ColumnUserID) {
+                                        case 0: delta = _stricmp(a.serviceName, b.serviceName); break;
+                                        case 1: delta = _stricmp(a.displayName, b.displayName); break;
+                                        case 2: delta = _stricmp(a.reason, b.reason); break;
+                                        case 3: delta = (int)a.processId - (int)b.processId; break;
+                                    }
+                                    if (delta != 0)
+                                        return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                                }
+                                return false;
+                            });
+                        sort_specs->SpecsDirty = false;
+                    }
+
                 for (auto& s : g_state.services) {
                     if (!s.isSuspicious) continue;
+                    if (g_state.svcFilter[0] &&
+                        !str_icontains(s.serviceName, g_state.svcFilter) &&
+                        !str_icontains(s.displayName, g_state.svcFilter) &&
+                        !str_icontains(s.reason, g_state.svcFilter))
+                        continue;
                     ImGui::TableNextRow();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(s.serviceName);
@@ -1326,6 +1535,9 @@ static void DrawTab6_DeepScan() {
     /* --- 启动项 --- */
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::DANGER), u8"⚠ 可疑启动项");
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"注册表或启动文件夹中的可疑自启动条目");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##startupf", u8"🔍 筛选启动项", g_state.startupFilter, sizeof(g_state.startupFilter));
     ImGui::Separator();
     if (g_state.startups.empty()) {
         ImGui::TextDisabled(u8"点击上方按钮开始扫描启动项");
@@ -1336,17 +1548,47 @@ static void DrawTab6_DeepScan() {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::OK_GREEN),
                 u8"✓ 未检测到可疑启动项（已扫描 %zu 个）", g_state.startups.size());
         } else {
-            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 5);
+            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 8);
             if (ImGui::BeginTable("##startup", 4,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, sz)) {
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                    ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, sz)) {
                 ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn(u8"名称",     ImGuiTableColumnFlags_WidthFixed, 200.0f);
-                ImGui::TableSetupColumn(u8"路径",     ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn(u8"位置",     ImGuiTableColumnFlags_WidthFixed, 180.0f);
-                ImGui::TableSetupColumn(u8"原因",     ImGuiTableColumnFlags_WidthFixed, 200.0f);
+                ImGui::TableSetupColumn(u8"名称",     ImGuiTableColumnFlags_WidthFixed, 200.0f, 0);
+                ImGui::TableSetupColumn(u8"路径",     ImGuiTableColumnFlags_WidthStretch, 0.0f, 1);
+                ImGui::TableSetupColumn(u8"位置",     ImGuiTableColumnFlags_WidthFixed, 180.0f, 2);
+                ImGui::TableSetupColumn(u8"原因",     ImGuiTableColumnFlags_WidthFixed, 200.0f, 3);
                 ImGui::TableHeadersRow();
+
+                if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                    if (sort_specs->SpecsDirty) {
+                        std::sort(g_state.startups.begin(), g_state.startups.end(),
+                            [&](const StartupEntry& a, const StartupEntry& b) {
+                                for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                    const auto& spec = sort_specs->Specs[n];
+                                    int delta = 0;
+                                    switch (spec.ColumnUserID) {
+                                        case 0: delta = _stricmp(a.name, b.name); break;
+                                        case 1: delta = _stricmp(a.path, b.path); break;
+                                        case 2: delta = _stricmp(a.location, b.location); break;
+                                        case 3: delta = _stricmp(a.reason, b.reason); break;
+                                    }
+                                    if (delta != 0)
+                                        return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                                }
+                                return false;
+                            });
+                        sort_specs->SpecsDirty = false;
+                    }
+
                 for (auto& s : g_state.startups) {
                     if (!s.isSuspicious) continue;
+                    if (g_state.startupFilter[0] &&
+                        !str_icontains(s.name, g_state.startupFilter) &&
+                        !str_icontains(s.path, g_state.startupFilter) &&
+                        !str_icontains(s.location, g_state.startupFilter) &&
+                        !str_icontains(s.reason, g_state.startupFilter))
+                        continue;
                     ImGui::TableNextRow();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(s.name);
@@ -1364,6 +1606,9 @@ static void DrawTab6_DeepScan() {
     /* --- 网络连接 --- */
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::DANGER), u8"⚠ 可疑网络连接");
     if (ImGui::IsItemHovered(0)) ImGui::SetTooltip(u8"已建立至非常见端口的连接或进程名含敏感词");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##connf", u8"🔍 筛选连接", g_state.connFilter, sizeof(g_state.connFilter));
     ImGui::Separator();
     if (g_state.connections.empty()) {
         ImGui::TextDisabled(u8"点击上方按钮开始扫描网络连接");
@@ -1374,19 +1619,60 @@ static void DrawTab6_DeepScan() {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col::OK_GREEN),
                 u8"✓ 未检测到可疑网络连接（已扫描 %zu 个）", g_state.connections.size());
         } else {
-            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 6);
+            ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 8);
             if (ImGui::BeginTable("##conn", 6,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, sz)) {
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                    ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, sz)) {
                 ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn(u8"协议",       ImGuiTableColumnFlags_WidthFixed, 50.0f);
-                ImGui::TableSetupColumn(u8"本地地址",   ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                ImGui::TableSetupColumn(u8"远程地址",   ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                ImGui::TableSetupColumn(u8"状态",       ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                ImGui::TableSetupColumn(u8"进程",       ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                ImGui::TableSetupColumn(u8"原因",       ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn(u8"协议",       ImGuiTableColumnFlags_WidthFixed, 50.0f, 0);
+                ImGui::TableSetupColumn(u8"本地地址",   ImGuiTableColumnFlags_WidthFixed, 150.0f, 1);
+                ImGui::TableSetupColumn(u8"远程地址",   ImGuiTableColumnFlags_WidthFixed, 150.0f, 2);
+                ImGui::TableSetupColumn(u8"状态",       ImGuiTableColumnFlags_WidthFixed, 80.0f, 3);
+                ImGui::TableSetupColumn(u8"进程",       ImGuiTableColumnFlags_WidthFixed, 140.0f, 4);
+                ImGui::TableSetupColumn(u8"原因",       ImGuiTableColumnFlags_WidthStretch, 0.0f, 5);
                 ImGui::TableHeadersRow();
+
+                if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                    if (sort_specs->SpecsDirty) {
+                        std::sort(g_state.connections.begin(), g_state.connections.end(),
+                            [&](const ConnectionInfo& a, const ConnectionInfo& b) {
+                                for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                    const auto& spec = sort_specs->Specs[n];
+                                    int delta = 0;
+                                    switch (spec.ColumnUserID) {
+                                        case 0: delta = (int)a.state - (int)b.state; break;
+                                        case 1: delta = _stricmp(a.localAddr, b.localAddr); break;
+                                        case 2: delta = _stricmp(a.remoteAddr, b.remoteAddr); break;
+                                        case 3: delta = _stricmp(tcp_state_str(a.state), tcp_state_str(b.state)); break;
+                                        case 4: delta = _stricmp(a.processName, b.processName); break;
+                                        case 5: delta = _stricmp(a.reason, b.reason); break;
+                                    }
+                                    if (delta != 0)
+                                        return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                                }
+                                return false;
+                            });
+                        sort_specs->SpecsDirty = false;
+                    }
+
                 for (auto& c : g_state.connections) {
                     if (!c.isSuspicious) continue;
+                    if (g_state.connFilter[0]) {
+                        char localStr[64], remoteStr[64];
+                        snprintf(localStr, sizeof(localStr), "%s:%lu", c.localAddr, (unsigned long)c.localPort);
+                        if (c.remotePort == 0) snprintf(remoteStr, sizeof(remoteStr), "-");
+                        else snprintf(remoteStr, sizeof(remoteStr), "%s:%lu", c.remoteAddr, (unsigned long)c.remotePort);
+                        const char* proto = (c.state == 0) ? "UDP" : "TCP";
+                        const char* stateStr = (c.state == 0) ? "UDP" : tcp_state_str(c.state);
+                        if (!str_icontains(proto, g_state.connFilter) &&
+                            !str_icontains(localStr, g_state.connFilter) &&
+                            !str_icontains(remoteStr, g_state.connFilter) &&
+                            !str_icontains(stateStr, g_state.connFilter) &&
+                            !str_icontains(c.processName, g_state.connFilter) &&
+                            !str_icontains(c.reason, g_state.connFilter))
+                            continue;
+                    }
                     ImGui::TableNextRow();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
                     const char* proto = (c.state == 0) ? "UDP" : "TCP";
@@ -1471,21 +1757,65 @@ static void DrawTab7_FileSystem() {
     ImGui::Spacing();
 
     /* --- 结果表格 --- */
+    if (!g_state.fileEntries.empty()) {
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputTextWithHint("##filef", u8"🔍 筛选文件", g_state.fileFilter, sizeof(g_state.fileFilter));
+        ImGui::Spacing();
+    }
     if (g_state.fileEntries.empty()) {
         ImGui::TextDisabled(u8"选择盘符后点击扫描按钮开始文件系统扫描");
     } else {
         ImVec2 sz(-1, ImGui::GetTextLineHeightWithSpacing() * 16);
         if (ImGui::BeginTable("##files", 5,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, sz)) {
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti, sz)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn(u8"文件名",       ImGuiTableColumnFlags_WidthFixed, 200.0f);
-            ImGui::TableSetupColumn(u8"完整路径",     ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn(u8"大小",         ImGuiTableColumnFlags_WidthFixed, 90.0f);
-            ImGui::TableSetupColumn(u8"PE 信息",      ImGuiTableColumnFlags_WidthFixed, 160.0f);
-            ImGui::TableSetupColumn(u8"触发原因",     ImGuiTableColumnFlags_WidthFixed, 280.0f);
+            ImGui::TableSetupColumn(u8"文件名",       ImGuiTableColumnFlags_WidthFixed, 200.0f, 0);
+            ImGui::TableSetupColumn(u8"完整路径",     ImGuiTableColumnFlags_WidthStretch, 0.0f, 1);
+            ImGui::TableSetupColumn(u8"大小",         ImGuiTableColumnFlags_WidthFixed, 90.0f, 2);
+            ImGui::TableSetupColumn(u8"PE 信息",      ImGuiTableColumnFlags_WidthFixed, 160.0f, 3);
+            ImGui::TableSetupColumn(u8"触发原因",     ImGuiTableColumnFlags_WidthFixed, 280.0f, 4);
             ImGui::TableHeadersRow();
+
+            if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+                if (sort_specs->SpecsDirty) {
+                    std::sort(g_state.fileEntries.begin(), g_state.fileEntries.end(),
+                        [&](const GdsFileEntry& a, const GdsFileEntry& b) {
+                            for (int n = 0; n < sort_specs->SpecsCount; n++) {
+                                const auto& spec = sort_specs->Specs[n];
+                                int delta = 0;
+                                switch (spec.ColumnUserID) {
+                                    case 0: delta = _stricmp(a.name, b.name); break;
+                                    case 1: delta = _stricmp(a.path, b.path); break;
+                                    case 2: {
+                                        unsigned long long sa = ((unsigned long long)a.sizeHigh << 32) | a.sizeLow;
+                                        unsigned long long sb = ((unsigned long long)b.sizeHigh << 32) | b.sizeLow;
+                                        delta = (sa > sb) - (sa < sb);
+                                        break;
+                                    }
+                                    case 3: {
+                                        delta = (int)b.pe.isPE - (int)a.pe.isPE;
+                                        if (delta == 0) delta = (int)(b.entropy * 10) - (int)(a.entropy * 10);
+                                        break;
+                                    }
+                                    case 4: delta = _stricmp(a.reason, b.reason); break;
+                                }
+                                if (delta != 0)
+                                    return (spec.SortDirection == ImGuiSortDirection_Ascending) ? (delta < 0) : (delta > 0);
+                            }
+                            return false;
+                        });
+                    sort_specs->SpecsDirty = false;
+                }
+
             for (auto& f : g_state.fileEntries) {
                 if (!f.isSuspicious) continue;
+                if (g_state.fileFilter[0] &&
+                    !str_icontains(f.name, g_state.fileFilter) &&
+                    !str_icontains(f.path, g_state.fileFilter) &&
+                    !str_icontains(f.reason, g_state.fileFilter))
+                    continue;
                 ImGui::TableNextRow();
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, col::DANGER_BG);
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(f.name);
@@ -1650,14 +1980,14 @@ static void DrawMainWindow() {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::Begin(u8"Gugas 安全自检工具", nullptr, flags);
+    ImGui::Begin(u8"Gugas", nullptr, flags);
     ImGui::PopStyleVar(2);
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col::INFO_BLUE));
-    ImGui::Text(u8"Gugas —— 网吧上机前安全自检");
+    ImGui::Text(u8"Gugas v0.1.5");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::TextDisabled(u8"  纯只读审计 · 不修改任何系统配置");
+    ImGui::TextDisabled(u8" a zayoka presents);
     ImGui::Separator();
 
     DrawNotifications(ImGui::GetIO().DeltaTime);
