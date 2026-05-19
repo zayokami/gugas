@@ -36,5 +36,4 @@ desktop.ini
 
 # Gugas runtime data
 /gugas_rules.ini
-*.dii.artifacts
-/sounds
+*.dii.a

@@ -1,6 +1,7 @@
 # Gugas
 
-Gugas 是一款 Windows 平台安全自检工具，采用**纯只读审计**设计——不修改任何系统配置、注册表或文件。适用于网吧上机前、借用他人电脑后等场景，帮助用户快速发现系统中潜在的可疑进程、驱动、网络连接、启动项及异常文件。
+Gugas 是一款 Windows 平台安全自检工具。
+“Gugas”是什么意思？是企鹅叫！咕咕嘎嘎！ 
 
 > **警告**：本工具仅可用于你有权检测的机器（如自有 PC、或经机主明确同意）。作者对任何滥用行为不承担责任。
 
@@ -39,7 +40,7 @@ Gugas 是一款 Windows 平台安全自检工具，采用**纯只读审计**设�
 
 ### 依赖
 
-- [MinGW-w64 GCC](https://www.mingw-w64.org/)（本项目使用 GCC 15.2.0）
+- [MinGW-w64 GCC](https://www.mingw-w64.org/)
 - [CMake](https://cmake.org/) >= 3.16
 - [ImGui](https://github.com/ocornut/imgui) v1.92.8（已作为 Git Submodule 包含）
 
@@ -63,8 +64,8 @@ cmake --build build --parallel
 ```
 
 生成物：
-- `build/gugas_core.dll` —— 核心检测库
-- `build/Gugas.exe` —— 前端可执行程序
+- `build/gugas_core.dll`
+- `build/Gugas.exe`
 
 ### 运行
 
